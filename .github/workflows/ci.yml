@@ -239,9 +239,7 @@ jobs:
       # here between the weekly Dependabot runs instead of sitting unnoticed.
       - name: Check advisories
         run: cargo deny check advisories
-      # Licenses / bans / sources are reported but not yet gating, to avoid
-      # blocking unrelated PRs on a pre-existing finding. Tighten to blocking
-      # once the current tree is known-clean.
+      # Licenses / bans / sources are gating: supply-chain and license
+      # violations block the build to ensure policy is enforced.
       - name: Check licenses, bans, and sources
         run: cargo deny check licenses bans sources
-        continue-on-error: true
