@@ -277,6 +277,8 @@ pub async fn fetch_and_store(
     let mut total_inserted = 0u64;
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
+    let mut page_count = 0usize;
+    let mut last_seen_ledger = start;
     // Contracts seen this cycle, used to bound per-contract instance reads when
     // no explicit CONTRACT_IDS list does it for us.
     let mut active_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -293,16 +295,37 @@ pub async fn fetch_and_store(
         Vec<(usize, Vec<String>)>,
     > = std::collections::HashMap::new();
     loop {
-        let page = rpc
+        let page = match rpc
             .get_events(
                 Some(start),
                 &config.contract_ids,
                 cursor_token.clone(),
                 config.page_size,
             )
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                if page_count > 0 {
+                    warn!(
+                        error = %e,
+                        page = page_count + 1,
+                        from = last_seen_ledger,
+                        to = tip,
+                        "RPC error on non-first page of batch; recording missed range"
+                    );
+                    let _ = cursor::incr_errors(pool).await;
+                    record_missed_range(pool, last_seen_ledger, tip, &e.to_string()).await?;
+                    break;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+        page_count += 1;
         let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
         for ev in &page.events {
+            last_seen_ledger = last_seen_ledger.max(ev.ledger);
             // Interface lookups are cached, so this is one fetch per contract.
             let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
             // Only needed for index-all instance reads (see below).
@@ -410,6 +433,119 @@ pub async fn fetch_and_store(
             not_enriched_count,
         },
     ))
+}
+
+/// Record a ledger range missed due to a mid-batch page RPC failure.
+pub async fn record_missed_range(
+    pool: &PgPool,
+    from_ledger: i64,
+    to_ledger: i64,
+    reason: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO missed_ranges (from_ledger, to_ledger, reason, detected_at) \
+         VALUES ($1, $2, $3, NOW())",
+    )
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replay all recorded missed ranges that have not yet been recovered.
+pub async fn recover_gaps(
+    pool: &PgPool,
+    rpc: &RpcClient,
+    config: &Config,
+    specs: &SpecCache,
+) -> anyhow::Result<()> {
+    #[derive(sqlx::FromRow)]
+    struct MissedRange {
+        id: i64,
+        from_ledger: i64,
+        to_ledger: i64,
+    }
+
+    let unrecovered: Vec<MissedRange> = sqlx::query_as(
+        "SELECT id, from_ledger, to_ledger FROM missed_ranges WHERE recovered_at IS NULL ORDER BY from_ledger ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if unrecovered.is_empty() {
+        info!("no unrecovered missed ranges found");
+        return Ok(());
+    }
+
+    info!(count = unrecovered.len(), "replaying recorded missed ranges");
+
+    for range in unrecovered {
+        info!(
+            id = range.id,
+            from = range.from_ledger,
+            to = range.to_ledger,
+            "replaying missed range"
+        );
+
+        let mut cursor_token: Option<String> = None;
+        let mut total_inserted = 0u64;
+
+        loop {
+            let page = rpc
+                .get_events(
+                    Some(range.from_ledger),
+                    &config.contract_ids,
+                    cursor_token.clone(),
+                    config.page_size,
+                )
+                .await?;
+
+            let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
+            let mut stop = false;
+
+            for ev in &page.events {
+                if ev.ledger > range.to_ledger {
+                    stop = true;
+                    break;
+                }
+                let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
+                let new_event = to_new_event(ev, spec.as_deref());
+                batch.push(new_event);
+            }
+
+            let n = batch.len();
+            if !batch.is_empty() {
+                total_inserted += store::insert_events(pool, &batch).await?;
+            }
+
+            if stop {
+                break;
+            }
+
+            cursor_token = page.cursor;
+            if n < config.page_size as usize || cursor_token.is_none() {
+                break;
+            }
+        }
+
+        sqlx::query("UPDATE missed_ranges SET recovered_at = NOW() WHERE id = $1")
+            .bind(range.id)
+            .execute(pool)
+            .await?;
+
+        info!(
+            id = range.id,
+            from = range.from_ledger,
+            to = range.to_ledger,
+            events_inserted = total_inserted,
+            "missed range recovered successfully"
+        );
+    }
+
+    info!("all missed ranges replayed successfully");
+    Ok(())
 }
 
 /// Re-fetch events from a range of recently-closed ledgers and upsert them,
