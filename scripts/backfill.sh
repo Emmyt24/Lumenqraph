@@ -5,6 +5,12 @@
 #
 # Note: bounded by RPC retention (~7 days); older ledgers are clamped.
 #
+# Concurrency: `backfill` is a maintenance command and does NOT take the live
+# indexer's leader advisory lock. It can run alongside a live poller without
+# blocking; its writes are idempotent (ON CONFLICT DO NOTHING) and it never
+# moves indexer_cursor.last_processed_ledger backwards. See
+# docs/DEEP_BACKFILL.md → "Concurrency model".
+#
 # RPC_TIMEOUT_SECS defaults to 30s, which is fine for the public SDF RPC. Slow
 # archive or paid RPC endpoints used for deep historical backfills often need
 # more headroom — 120s is a good starting point. A timeout aborts the whole

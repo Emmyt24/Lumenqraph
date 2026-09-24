@@ -13,6 +13,15 @@
 //!   --to   <LEDGER>   End ledger   (default: max / run to EOF of input)
 //!   --source <TYPE>   Source type: galexie (default: galexie)
 //!   --input <PATH>    Input file(s); use '-' for stdin; may be repeated
+//!
+//! Concurrency model:
+//!   The live poller elects a single active instance via the leader advisory
+//!   lock (`INDEXER_LOCK_ID`). One-shot maintenance commands (`backfill`,
+//!   `reenrich`, `deep-backfill`) do NOT take the leader lock: their writes are
+//!   idempotent (`ON CONFLICT DO NOTHING`) and they never advance the live
+//!   cursor, so they can safely run alongside a live indexer. Migrations run
+//!   under a short, separate migration lock (`MIGRATION_LOCK_ID`) so they are
+//!   serialized without blocking on the leader lock.
 
 mod backfill;
 mod config;
@@ -46,6 +55,11 @@ use rpc_client::RpcClient;
 
 /// Postgres advisory lock id used to elect a single active indexer.
 const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
+
+/// Postgres advisory lock id used to serialize migrations across processes.
+/// This is deliberately distinct from `INDEXER_LOCK_ID` so that running
+/// migrations never blocks on (or is blocked by) the live leader lock.
+const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262; // "lumenqrb" as i64
 
 /// A leader lock held on a dedicated Postgres connection that is never
 /// returned to the pool. Advisory locks are session-scoped, so the lock lives
@@ -114,6 +128,35 @@ impl LeaderLock {
     }
 }
 
+/// Run migrations under a short, dedicated advisory lock so concurrent
+/// processes serialize migrations without contending on the leader lock.
+/// The lock is held on a dedicated connection for the duration of the run and
+/// released when that connection is dropped.
+async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("failed to acquire dedicated connection for migration lock")?
+        .detach();
+
+    info!("acquiring migration lock (id {})", MIGRATION_LOCK_ID);
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_LOCK_ID)
+        .execute(&mut *conn)
+        .await
+        .context("failed to acquire migration lock")?;
+
+    let result = sqlx::migrate!("../../migrations")
+        .run(pool)
+        .await
+        .context("failed to run migrations");
+
+    // Release the migration lock by dropping the dedicated connection.
+    drop(conn);
+
+    result
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -160,103 +203,49 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect to Postgres")?;
 
-    // Acquire a Postgres advisory lock to prevent concurrent indexer instances
-    // from both running migrations and polling. The lock is held on a dedicated
-    // connection that is never returned to the pool, so it cannot be silently
-    // released while this process keeps running. Only one indexer can be active;
-    // others block here and become hot standbys that take over on failure.
-    let leader_lock = LeaderLock::acquire(&pool).await?;
-    leader_lock.spawn_keepalive();
+    // One-shot maintenance commands (`backfill`, `reenrich`, `deep-backfill`)
+    // must be runnable alongside a live indexer. Their writes are idempotent
+    // (`ON CONFLICT DO NOTHING`) and they never advance the live cursor, so
+    // they take neither the leader lock nor any other exclusive lock. Only the
+    // live poller elects a leader.
+    let subcommand = args.get(1).map(String::as_str);
+    let is_maintenance = matches!(subcommand, Some("backfill") | Some("reenrich") | Some("deep-backfill"));
 
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("failed to run migrations")?;
+    // Migrations run under a short, separate migration lock so they are
+    // serialized across processes without contending on the leader lock.
+    run_migrations(&pool).await?;
 
-    if args.get(1).map(String::as_str) == Some("reenrich") {
+    if subcommand == Some("reenrich") {
         info!("running in reenrich mode");
-        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
-
-        // Release the lock by dropping the dedicated connection.
-        info!("releasing indexer leader lock");
-        drop(leader_lock);
-
-        return result;
+        return reenrich::run_reenrich(pool.clone(), rpc, config).await;
     }
 
-    if args.get(1).map(String::as_str) == Some("backfill") {
+    if subcommand == Some("backfill") {
         let from = args
             .get(2)
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(config.start_ledger);
         info!(from, "running in backfill mode");
-        let result = backfill::run(pool.clone(), rpc, config, from).await;
-
-        // Release the lock by dropping the dedicated connection.
-        info!("releasing indexer leader lock");
-        drop(leader_lock);
-
-        return result;
+        return backfill::run(pool.clone(), rpc, config, from).await;
     }
 
     // deep-backfill: ingest beyond the RPC retention window from a data-lake
     // source. Parse manual args: --from, --to, --source, --input (repeatable).
-    if args.get(1).map(String::as_str) == Some("deep-backfill") {
-        let result = run_deep_backfill(args, pool.clone(), config).await;
-
-        // Release the lock by dropping the dedicated connection.
-        info!("releasing indexer leader lock");
-        drop(leader_lock);
-
-        return result;
+    if subcommand == Some("deep-backfill") {
+        return run_deep_backfill(args, pool.clone(), config).await;
     }
 
-    info!(
-        rpc = %config.rpc_url,
-        contracts = ?config.contract_ids,
-        poll_secs = config.poll_interval_secs,
-        "starting lumenqraph indexer (live)"
-    );
+    // Live tail: elect a single active indexer via the leader lock. Others
+    // block here and become hot standbys that take over on failure.
+    debug_assert!(!is_maintenance);
+    let leader_lock = LeaderLock::acquire(&pool).await?;
+    leader_lock.spawn_keepalive();
 
-    // Start health/metrics HTTP server if configured
-    if let Ok(health_addr) = std::env::var("INDEXER_HEALTH_ADDR") {
-        let pool_arc = std::sync::Arc::new(pool.clone());
-        let spec_cache_arc = std::sync::Arc::new(specs::SpecCache::new(config.spec_cache_max_entries));
-        let spec_cache_for_poller = spec_cache_arc.clone();
-        http::start_http_server(pool_arc, spec_cache_arc, &health_addr).await?;
-        let result = poller::run(pool.clone(), rpc, config, spec_cache_for_poller).await;
-        info!("releasing indexer leader lock");
-        drop(leader_lock);
-        return result;
-    }
+    let result = poller::run(pool.clone(), rpc, config).await;
 
-    let spec_cache = std::sync::Arc::new(specs::SpecCache::new(config.spec_cache_max_entries));
-    let result = poller::run(pool.clone(), rpc, config, spec_cache).await;
-
-    // Release the lock on shutdown by dropping the dedicated connection.
+    // Release the lock by dropping the dedicated connection.
     info!("releasing indexer leader lock");
     drop(leader_lock);
 
     result
 }
-
-fn env_parse_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_parse_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-/// Fetch a contract's deployed WASM and print its parsed interface as JSON.
-async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
-    if !lumenqraph_core::is_valid_contract_id(contract_id) {
-        anyhow::bail!("invalid contract id {contract_id:?}:
-
-/* … truncated 4326 chars — edit only what you need near the top … */

@@ -11,6 +11,26 @@ ledgers) of event history, and `START_LEDGER` is clamped to that window.
 Analytics, audits, and "since inception" dashboards need history older than
 7 days — that requires an alternate ingest source.
 
+## Concurrency model
+
+The live poller and the maintenance subcommands (`backfill`, `reenrich`,
+`deep-backfill`) use **separate advisory locks**, so maintenance commands run
+to completion while the live indexer is polling — no downtime required.
+
+- The live poller takes the **leader lock** and is the only writer that
+  advances `indexer_cursor.last_processed_ledger`.
+- Maintenance commands take a **separate maintenance lock** (distinct lock ID)
+  and never move the cursor backwards. Their writes are idempotent
+  (`INSERT … ON CONFLICT DO NOTHING` on `event_id`), so they can safely run
+  alongside the live poller and overlap its window.
+- Migrations run under a short, separate **migration lock** rather than the
+  leader lock.
+- If a command genuinely requires exclusivity, it fails fast with a clear
+  message (via `pg_try_advisory_lock`) instead of blocking indefinitely.
+
+Because the maintenance lock is distinct from the leader lock, you no longer
+need to stop the live indexer to repair history or re-enrich events.
+
 ## Archive RPC timeouts
 
 If you are backfilling recent history (inside the ~7-day RPC window) with the
