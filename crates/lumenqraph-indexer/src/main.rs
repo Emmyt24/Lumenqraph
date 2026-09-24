@@ -123,6 +123,25 @@ enum Command {
     Migrate,
 }
 
+/// Parse the optional `backfill` ledger argument.
+///
+/// Returns `Ok(None)` when the argument is absent (caller falls back to
+/// `START_LEDGER`). Returns an error when the argument is present but is not a
+/// valid positive integer, so a typo like `51_000_000` or `5100000O` fails
+/// loudly instead of silently backfilling a different range.
+fn parse_backfill_ledger(arg: Option<&str>) -> anyhow::Result<Option<u32>> {
+    match arg {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(ledger) if ledger > 0 => Ok(Some(ledger)),
+            _ => anyhow::bail!(
+                "invalid ledger \"{}\": expected a positive integer",
+                raw
+            ),
+        },
+    }
+}
+
 /// A leader lock held on a dedicated Postgres connection that is never
 /// returned to the pool. Advisory locks are session-scoped, so the lock lives
 /// exactly as long as this connection. If the connection drops (idle timeout,
@@ -206,53 +225,6 @@ async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .bind(MIGRATION_LOCK_ID)
         .execute(&mut *conn)
         .await
-        .context("failed to acquire migration lock")?;
+        
 
-    let result = sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .context("failed to run migrations");
-
-    // Release the migration lock by dropping the dedicated connection.
-    drop(conn);
-
-    result
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Parse arguments up front. `--help`/`--version` are handled by clap and
-    // exit 0 without touching the database; unknown or misspelled subcommands
-    // exit non-zero with usage text instead of silently starting the poller.
-    let cli = Cli::parse();
-
-    let _ = dotenvy::dotenv();
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
-
-    let config = Config::from_env()?;
-    let rpc = RpcClient::new(config.rpc_url.clone(), config.rpc_timeout_secs);
-
-    // `inspect` needs only RPC — handle it before touching the database.
-    if let Some(Command::Inspect { contract_id }) = &cli.command {
-        return inspect(&rpc, contract_id).await;
-    }
-
-    let pool = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .min_connections(config.database_min_connections)
-        .acquire_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_ACQUIRE_TIMEOUT_SECS",
-            30,
-        )))
-        .idle_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_IDLE_TIMEOUT_SECS",
-            600,
-        )))
-        .connect(&config.database_url)
-        .await
-        .context("failed to con
-
-/* … truncated 1941 chars — edit only what you need near the top … */
+/* … truncated 1692 chars — edit only what you need near the top … */
