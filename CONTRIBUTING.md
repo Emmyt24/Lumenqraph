@@ -17,6 +17,20 @@ cargo run -p lumenqraph-api
 
 ## Before you push
 
+Run the aggregate CI target to reproduce what CI checks locally (minus the
+network-dependent E2E suite):
+
+```bash
+make ci
+```
+
+This runs `cargo fmt`, `cargo clippy`, the unit tests, the TypeScript and Python
+SDK checks, the OpenAPI drift check, and `cargo deny`. Run `make help` to see
+all available targets, including the individual steps (`fmt`, `lint`, `test`,
+`sdk-ts`, `sdk-py`, `openapi-check`, `deny`, `audit`, `dashboards-check`).
+
+If you prefer to run the steps by hand:
+
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
