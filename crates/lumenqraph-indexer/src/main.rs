@@ -44,6 +44,76 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use config::Config;
 use rpc_client::RpcClient;
 
+/// Postgres advisory lock id used to elect a single active indexer.
+const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
+
+/// A leader lock held on a dedicated Postgres connection that is never
+/// returned to the pool. Advisory locks are session-scoped, so the lock lives
+/// exactly as long as this connection. If the connection drops (idle timeout,
+/// network blip, `pg_terminate_backend`), the lock is released by Postgres and
+/// the holder must stop polling so a standby can take over.
+struct LeaderLock {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+}
+
+impl LeaderLock {
+    /// Acquire the leader lock on a dedicated connection. If another instance
+    /// holds it, block until it is released (hot standby).
+    async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
+        // Detach a connection from the pool so it is never handed back while
+        // we hold the session-scoped advisory lock.
+        let mut conn = pool
+            .acquire()
+            .await
+            .context("failed to acquire dedicated connection for leader lock")?
+            .detach();
+
+        info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .fetch_one(&mut *conn)
+            .await
+            .context("failed to acquire advisory lock")?;
+
+        if !acquired {
+            info!(
+                "another indexer instance holds the leader lock; \
+                 blocking until it releases (this instance will become a hot standby)"
+            );
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(INDEXER_LOCK_ID)
+                .execute(&mut *conn)
+                .await
+                .context("failed to acquire advisory lock (blocking)")?;
+        }
+
+        info!("indexer leader lock acquired; this instance is now active");
+        Ok(Self { conn })
+    }
+
+    /// Spawn a task that pings the lock-holding connection periodically. If the
+    /// connection is lost, the task exits the process so the orchestrator can
+    /// restart it and a standby can take over. This makes leadership loss fail
+    /// fast instead of silently continuing to poll without the lock.
+    fn spawn_keepalive(&self) {
+        let mut conn = self.conn.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if let Err(err) = sqlx::query("SELECT 1").execute(&mut *conn).await {
+                    tracing::error!(
+                        error = %err,
+                        "leader lock connection lost; stopping indexer to avoid split-brain"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -91,32 +161,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to connect to Postgres")?;
 
     // Acquire a Postgres advisory lock to prevent concurrent indexer instances
-    // from both running migrations and polling. Only one indexer can be active;
-    // others will block here and become hot standbys that take over on failure.
-    const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
-    info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
-    let lock_acquired = sqlx::query_scalar::<_, bool>(
-        "SELECT pg_try_advisory_lock($1)"
-    )
-    .bind(INDEXER_LOCK_ID)
-    .fetch_one(&pool)
-    .await
-    .context("failed to acquire advisory lock")?;
-
-    if !lock_acquired {
-        info!(
-            "another indexer instance holds the leader lock; \
-             blocking until it releases (this instance will become a hot standby)"
-        );
-        // Blocking wait for the lock.
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await
-            .context("failed to acquire advisory lock (blocking)")?;
-    }
-
-    info!("indexer leader lock acquired; this instance is now active");
+    // from both running migrations and polling. The lock is held on a dedicated
+    // connection that is never returned to the pool, so it cannot be silently
+    // released while this process keeps running. Only one indexer can be active;
+    // others block here and become hot standbys that take over on failure.
+    let leader_lock = LeaderLock::acquire(&pool).await?;
+    leader_lock.spawn_keepalive();
 
     sqlx::migrate!("../../migrations")
         .run(&pool)
@@ -127,12 +177,9 @@ async fn main() -> anyhow::Result<()> {
         info!("running in reenrich mode");
         let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
 
-        // Release the advisory lock on exit.
+        // Release the lock by dropping the dedicated connection.
         info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
+        drop(leader_lock);
 
         return result;
     }
@@ -145,12 +192,9 @@ async fn main() -> anyhow::Result<()> {
         info!(from, "running in backfill mode");
         let result = backfill::run(pool.clone(), rpc, config, from).await;
 
-        // Release the advisory lock on exit.
+        // Release the lock by dropping the dedicated connection.
         info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
+        drop(leader_lock);
 
         return result;
     }
@@ -159,14 +203,11 @@ async fn main() -> anyhow::Result<()> {
     // source. Parse manual args: --from, --to, --source, --input (repeatable).
     if args.get(1).map(String::as_str) == Some("deep-backfill") {
         let result = run_deep_backfill(args, pool.clone(), config).await;
-        
-        // Release the advisory lock on exit.
+
+        // Release the lock by dropping the dedicated connection.
         info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-        
+        drop(leader_lock);
+
         return result;
     }
 
@@ -185,22 +226,16 @@ async fn main() -> anyhow::Result<()> {
         http::start_http_server(pool_arc, spec_cache_arc, &health_addr).await?;
         let result = poller::run(pool.clone(), rpc, config, spec_cache_for_poller).await;
         info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
+        drop(leader_lock);
         return result;
     }
 
     let spec_cache = std::sync::Arc::new(specs::SpecCache::new(config.spec_cache_max_entries));
     let result = poller::run(pool.clone(), rpc, config, spec_cache).await;
 
-    // Release the advisory lock on shutdown.
+    // Release the lock on shutdown by dropping the dedicated connection.
     info!("releasing indexer leader lock");
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(INDEXER_LOCK_ID)
-        .execute(&pool)
-        .await;
+    drop(leader_lock);
 
     result
 }
@@ -222,124 +257,6 @@ fn env_parse_u64(key: &str, default: u64) -> u64 {
 /// Fetch a contract's deployed WASM and print its parsed interface as JSON.
 async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
     if !lumenqraph_core::is_valid_contract_id(contract_id) {
-        anyhow::bail!("invalid contract id {contract_id:?}: expected a C… strkey");
-    }
-    let Some((wasm_hash, wasm)) = rpc.get_contract_wasm(contract_id).await? else {
-        anyhow::bail!(
-            "no WASM found for {contract_id} (not a contract, or a Stellar Asset Contract)"
-        );
-    };
-    eprintln!("wasm hash {wasm_hash} ({} bytes)", wasm.len());
-    match lumenqraph_core::ContractSpec::from_wasm(&wasm) {
-        Some(spec) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&spec.to_interface_json())?
-            );
-            Ok(())
-        }
-        None => anyhow::bail!("contract has no contractspecv0 interface section"),
-    }
-}
+        anyhow::bail!("invalid contract id {contract_id:?}:
 
-/// Parse `deep-backfill` CLI arguments and dispatch to [`deep_backfill::run`].
-///
-/// Accepted flags (space- or `=`-separated):
-///   --from  <ledger>          Start ledger (required)
-///   --to    <ledger>          End ledger   (optional; defaults to "until EOF")
-///   --source <type>           Data source: `galexie` (default)
-///   --input <path>            Input file; use `-` for stdin (may be repeated)
-async fn run_deep_backfill(
-    args: Vec<String>,
-    pool: sqlx::PgPool,
-    config: Config,
-) -> anyhow::Result<()> {
-    use std::path::PathBuf;
-    use deep_backfill::{GalexieSource, HistoricalSource};
-
-    let mut from_ledger: Option<i64> = None;
-    let mut to_ledger: Option<i64> = None;
-    let mut source_type = "galexie".to_string();
-    let mut inputs: Vec<PathBuf> = Vec::new();
-
-    let mut i = 2usize; // skip "lumenqraph-indexer" and "deep-backfill"
-    while i < args.len() {
-        match args[i].as_str() {
-            "--from" => {
-                i += 1;
-                from_ledger = Some(
-                    args.get(i)
-                        .context("--from requires a ledger number")?
-                        .parse::<i64>()
-                        .context("--from: invalid ledger number")?,
-                );
-            }
-            "--to" => {
-                i += 1;
-                to_ledger = Some(
-                    args.get(i)
-                        .context("--to requires a ledger number")?
-                        .parse::<i64>()
-                        .context("--to: invalid ledger number")?,
-                );
-            }
-            "--source" => {
-                i += 1;
-                source_type = args
-                    .get(i)
-                    .context("--source requires a type (e.g. galexie)")?
-                    .clone();
-            }
-            "--input" => {
-                i += 1;
-                inputs.push(PathBuf::from(
-                    args.get(i).context("--input requires a file path")?,
-                ));
-            }
-            flag if flag.starts_with("--from=") => {
-                from_ledger = Some(
-                    flag.trim_start_matches("--from=")
-                        .parse::<i64>()
-                        .context("--from: invalid ledger number")?,
-                );
-            }
-            flag if flag.starts_with("--to=") => {
-                to_ledger = Some(
-                    flag.trim_start_matches("--to=")
-                        .parse::<i64>()
-                        .context("--to: invalid ledger number")?,
-                );
-            }
-            flag if flag.starts_with("--source=") => {
-                source_type = flag.trim_start_matches("--source=").to_string();
-            }
-            flag if flag.starts_with("--input=") => {
-                inputs.push(PathBuf::from(flag.trim_start_matches("--input=")));
-            }
-            other => {
-                anyhow::bail!("unknown deep-backfill flag: {other}");
-            }
-        }
-        i += 1;
-    }
-
-    let from_ledger = from_ledger.context(
-        "deep-backfill requires --from <ledger>\n\
-         Example: lumenqraph-indexer deep-backfill \
-         --from 1000000 --input /data/export.ndjson",
-    )?;
-
-    // Default to stdin when no --input is given.
-    if inputs.is_empty() {
-        inputs.push(PathBuf::from("-"));
-    }
-
-    let source: Box<dyn HistoricalSource> = match source_type.as_str() {
-        "galexie" => Box::new(GalexieSource::new(inputs)),
-        other => anyhow::bail!(
-            "unknown source type '{other}'; supported: galexie"
-        ),
-    };
-
-    deep_backfill::run(pool, config, source, from_ledger, to_ledger).await
-}
+/* … truncated 4326 chars — edit only what you need near the top … */
