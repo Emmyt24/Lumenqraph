@@ -12,7 +12,7 @@
 //! deep-backfill options:
 //!   --from <LEDGER>   Start ledger (required)
 //!   --to   <LEDGER>   End ledger   (default: max / run to EOF of input)
-//!   --source <TYPE>   Source type: galexie (default: galexie)
+//!   --source <TYPE>   Source type: galexie, horizon (default: galexie)
 //!   --input <PATH>    Input file(s); use '-' for stdin; may be repeated
 
 mod backfill;
@@ -352,8 +352,16 @@ async fn run_deep_backfill(
 
     let source: Box<dyn HistoricalSource> = match source_type.as_str() {
         "galexie" => Box::new(GalexieSource::new(inputs)),
+        "horizon" => {
+            let base_url = inputs
+                .first()
+                .and_then(|p| p.to_str())
+                .filter(|s| *s != "-")
+                .unwrap_or("https://horizon.stellar.org");
+            Box::new(deep_backfill::HorizonSource::new(base_url))
+        }
         other => anyhow::bail!(
-            "unknown source type '{other}'; supported: galexie"
+            "unknown source type '{other}'; supported: galexie, horizon"
         ),
     };
 
