@@ -111,6 +111,28 @@ export interface EventsResponse {
   next_cursor: string | null;
 }
 
+export interface StatsBucket {
+  bucket: string;
+  count: number;
+  breakdown?: Record<string, number>;
+}
+
+export interface StatsResponse {
+  data: StatsBucket[];
+  total: number;
+}
+
+export interface GetStatsOptions extends RequestOptions {
+  resolution?: "1m" | "1h" | "1d" | "1w" | "1M" | "hour" | "day" | string;
+  window?: string;
+  bucket?: "hour" | "day" | "ledger" | string;
+  groupBy?: "event_name" | string;
+  from?: string;
+  to?: string;
+  fromLedger?: number;
+  toLedger?: number;
+}
+
 export interface CallResult {
   contract_id: string;
   function: string;
@@ -339,6 +361,29 @@ export class LumenqraphClient {
         version: opts?.version,
       },
       opts?.signal,
+    );
+  }
+
+  /**
+   * Retrieve time-bucketed event statistics for a contract.
+   */
+  getStats(
+    contractId: string,
+    opts: GetStatsOptions = {},
+  ): Promise<StatsResponse> {
+    return this.get<StatsResponse>(
+      `/contracts/${enc(contractId)}/stats`,
+      {
+        resolution: opts.resolution,
+        window: opts.window,
+        bucket: opts.bucket,
+        group_by: opts.groupBy,
+        from: opts.from,
+        to: opts.to,
+        from_ledger: opts.fromLedger,
+        to_ledger: opts.toLedger,
+      },
+      opts.signal,
     );
   }
 

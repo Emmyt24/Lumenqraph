@@ -139,6 +139,7 @@ const data = await lq.graphql<{ transfers: { edges: { node: unknown }[] } }>(`
 | `getData(id, { label, limit })` | `GET /contracts/:id/data` |
 | `getDataKey(id, keyHash, { limit })` | `GET /contracts/:id/data/:keyHash` |
 | `listEvents(id, { limit, offset, eventName })` | `GET /contracts/:id/events` |
+| `getStats(id, { resolution, window })` | `GET /contracts/:id/stats` |
 | `listTransfers(id?, { limit, offset })` | `GET /contracts/:id/transfers` |
 | `listFunctions(id)` | `GET /contracts/:id/functions` |
 | `call(id, { function, args, sourceAccount })` | `POST /contracts/:id/call` |
