@@ -82,6 +82,12 @@ jobs:
       # ── Build (and push on tag events) ──────────────────────────────────────
       # Each platform leg pushes to a per-platform manifest and produces a
       # digest, which is collected in the merge job below.
+      #
+      # The cargo-chef dependency layer in the Dockerfile is cached via the
+      # GitHub Actions cache (type=gha), scoped per platform so the amd64 and
+      # arm64 dependency layers don't clobber each other. A source-only change
+      # therefore reuses the cooked dependency layer and only rebuilds the
+      # workspace crates.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -99,8 +105,8 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ github.event.repository.updated_at }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
       # ── Save digest for the merge job ────────────────────────────────────────
       - name: Export digest

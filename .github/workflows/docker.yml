@@ -47,11 +47,13 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           push: false
+          load: true
           tags: ${{ env.IMAGE_NAME }}:test
           build-args: |
             GIT_COMMIT=${{ github.sha }}
