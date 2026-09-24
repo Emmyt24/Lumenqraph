@@ -91,6 +91,17 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
                 base_interval
             }
             Err(e) => {
+                // Permanent RPC errors (e.g. invalid params, method not found, invalid contract ID)
+                // are non-retryable configuration errors and must propagate immediately without
+                // triggering the backoff loop.
+                if crate::rpc_client::is_non_retryable_rpc_error(&e) {
+                    error!(
+                        error = %e,
+                        "permanent non-retryable RPC configuration error; exiting poll loop"
+                    );
+                    return Err(e);
+                }
+
                 consecutive_errors += 1;
                 let _ = cursor::incr_errors(&pool).await;
                 let _ = cursor::set_consecutive_errors(&pool, consecutive_errors).await;
@@ -601,5 +612,25 @@ mod tests {
         let circuit_open = max_consecutive_errors > 0 && consecutive_errors >= max_consecutive_errors;
         let sleep = if circuit_open { degraded } else { base };
         assert_eq!(sleep, degraded, "degraded interval should be used when circuit is open");
+    }
+
+    #[test]
+    fn non_retryable_rpc_errors_are_detected() {
+        use crate::rpc_client::{is_non_retryable_rpc_error, SorobanRpcError};
+
+        // Method not found (-32601) and Invalid params (-32602) are non-retryable
+        let err_32601 = anyhow::anyhow!(SorobanRpcError::new(-32601, "method not found", "getEvents"));
+        assert!(is_non_retryable_rpc_error(&err_32601));
+
+        let err_32602 = anyhow::anyhow!(SorobanRpcError::new(-32602, "invalid params", "getEvents"));
+        assert!(is_non_retryable_rpc_error(&err_32602));
+
+        // Even when wrapped in context, non-retryable errors are recognized
+        let wrapped = err_32601.context("failed to poll once");
+        assert!(is_non_retryable_rpc_error(&wrapped));
+
+        // Processing limit (-32001) is retryable
+        let retryable = anyhow::anyhow!(SorobanRpcError::new(-32001, "limit reached", "getEvents"));
+        assert!(!is_non_retryable_rpc_error(&retryable));
     }
 }
