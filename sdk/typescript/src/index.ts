@@ -324,6 +324,24 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /**
+   * Retrieve a generated SDK client for a contract.
+   * Returns the generated source code as a string.
+   */
+  generateSdk(
+    contractId: string,
+    opts?: { lang?: "ts"; version?: number } & RequestOptions,
+  ): Promise<string> {
+    return this.get<string>(
+      `/contracts/${enc(contractId)}/sdk`,
+      {
+        lang: opts?.lang,
+        version: opts?.version,
+      },
+      opts?.signal,
+    );
+  }
+
   /** Versioned instance-storage snapshots, newest first (`limit=1` = current). */
   getState(contractId: string, opts: { limit?: number; signal?: AbortSignal } = {}): Promise<ContractState> {
     return this.get(`/contracts/${enc(contractId)}/state`, { limit: opts.limit }, opts.signal);
