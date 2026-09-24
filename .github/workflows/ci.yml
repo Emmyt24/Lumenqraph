@@ -225,6 +225,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Ensure all GitHub Actions in .github/workflows are pinned to full commit SHAs
+      - name: Lint action SHA pinning
+        run: |
+          if grep -rnE 'uses: [^@]+@v[0-9]' .github/workflows; then
+            echo "Error: Unpinned actions found in .github/workflows. Pin all actions to full 40-character SHAs."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
