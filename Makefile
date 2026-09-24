@@ -24,18 +24,24 @@ test: ## Run tests (unit + integration, no Postgres required)
 
 test-db: db ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a running local Postgres)
 	@if [ -z "$$TEST_DATABASE_URL" ]; then \
-	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph; \
+	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph_test; \
 	fi; \
-	cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1; \
-	cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1; \
-	cargo test -p lumenqraph-api      -- --ignored --test-threads=1; \
-	cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
+	psql "$$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1 || \
+	  psql "postgres://lumenqraph:lumenqraph@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
+	    -c 'CREATE DATABASE lumenqraph_test' >/dev/null 2>&1 || true; \
+	cargo test -p lumenqraph-indexer  -- --ignored; \
+	cargo test -p lumenqraph-webhooks -- --ignored; \
+	cargo test -p lumenqraph-api      -- --ignored; \
+	cargo test -p lumenqraph-mcp      -- --ignored
 
 test-smoke: db ## Run the gated end-to-end smoke test (requires TEST_DATABASE_URL or a running local Postgres)
 	@if [ -z "$$TEST_DATABASE_URL" ]; then \
-	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph; \
+	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph_test; \
 	fi; \
-	cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
+	psql "$$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1 || \
+	  psql "postgres://lumenqraph:lumenqraph@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
+	    -c 'CREATE DATABASE lumenqraph_test' >/dev/null 2>&1 || true; \
+	cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored
 
 fmt: ## Format
 	cargo fmt --all

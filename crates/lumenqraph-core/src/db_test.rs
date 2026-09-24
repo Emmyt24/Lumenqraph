@@ -42,6 +42,10 @@ impl TestDb {
         let url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set to run Postgres-backed tests");
 
+        // Refuse to run against a database that doesn't look like a test DB.
+        // This prevents accidentally wiping a developer's dev database.
+        assert_test_database(&url);
+
         // Use a UUID so concurrent tests never collide on the schema name.
         let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
 
@@ -116,6 +120,36 @@ impl Drop for TestDb {
 /// Tests can use this to skip gracefully instead of failing.
 pub fn database_url() -> Option<String> {
     std::env::var("TEST_DATABASE_URL").ok()
+}
+
+/// Guard: refuse to run destructive DB tests against a database whose name
+/// does not contain `test`. This prevents `make test-db` (or a stray
+/// `TEST_DATABASE_URL`) from wiping a developer's dev database.
+fn assert_test_database(url: &str) {
+    let db_name = database_name(url);
+    assert!(
+        db_name.to_ascii_lowercase().contains("test"),
+        "refusing to run destructive DB tests against database `{db_name}`: \
+         the database name must contain `test` (set TEST_DATABASE_URL to a \
+         dedicated test database, e.g. lumenqraph_test)"
+    );
+}
+
+/// Extract the database name from a Postgres connection URL.
+///
+/// Handles `postgres://user:pass@host:port/dbname?params` and returns the
+/// path segment (without the leading slash). Falls back to an empty string
+/// when no database name is present.
+fn database_name(url: &str) -> String {
+    // Strip the scheme (everything up to and including `://`).
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    // Drop any query string.
+    let without_query = after_scheme.split('?').next().unwrap_or(after_scheme);
+    // The database name is the path segment after the first `/`.
+    match without_query.split_once('/') {
+        Some((_, db)) => db.to_string(),
+        None => String::new(),
+    }
 }
 
 /// Append (or replace) the `search_path` option in a Postgres connection URL.
