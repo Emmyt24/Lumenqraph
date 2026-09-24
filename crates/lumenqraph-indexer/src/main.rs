@@ -46,6 +46,7 @@ mod smoke;
 use std::time::Duration;
 
 use anyhow::Context;
+use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -60,6 +61,67 @@ const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
 /// This is deliberately distinct from `INDEXER_LOCK_ID` so that running
 /// migrations never blocks on (or is blocked by) the live leader lock.
 const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262; // "lumenqrb" as i64
+
+/// Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres.
+#[derive(Parser)]
+#[command(
+    name = "lumenqraph-indexer",
+    version,
+    about = "Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres",
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\ncommit: ",
+        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+        "\nbuilt: ",
+        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+    ),
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Live tail (default when no subcommand is given).
+    Run,
+    /// One-shot catch-up within the RPC window (~7 days) then exit.
+    Backfill {
+        /// Start ledger (defaults to the current cursor).
+        ledger: Option<u32>,
+    },
+    /// Gapless history from a data-lake export (#84).
+    DeepBackfill {
+        /// Start ledger (required).
+        #[arg(long)]
+        from: u32,
+        /// End ledger (default: max / run to EOF of input).
+        #[arg(long)]
+        to: Option<u32>,
+        /// Source type: galexie (default: galexie).
+        #[arg(long, default_value = "galexie")]
+        source: String,
+        /// Input file(s); use '-' for stdin; may be repeated.
+        #[arg(long = "input")]
+        input: Vec<String>,
+    },
+    /// Re-enrich historical events with newly-available specs.
+    Reenrich {
+        /// Restrict re-enrichment to a single contract.
+        #[arg(long)]
+        contract: Option<String>,
+        /// Re-enrich even events that already have a spec.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print a contract's on-chain interface.
+    Inspect {
+        /// Contract id to inspect.
+        contract_id: String,
+    },
+    /// Run database migrations and exit.
+    Migrate,
+}
 
 /// A leader lock held on a dedicated Postgres connection that is never
 /// returned to the pool. Advisory locks are session-scoped, so the lock lives
@@ -159,17 +221,10 @@ async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.get(1).map(|s| s.as_str()) == Some("--version") {
-        println!(
-            "lumenqraph-indexer {}\ncommit: {}\nbuilt: {}",
-            env!("CARGO_PKG_VERSION"),
-            option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
-            option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
-        );
-        return Ok(());
-    }
+    // Parse arguments up front. `--help`/`--version` are handled by clap and
+    // exit 0 without touching the database; unknown or misspelled subcommands
+    // exit non-zero with usage text instead of silently starting the poller.
+    let cli = Cli::parse();
 
     let _ = dotenvy::dotenv();
     tracing_subscriber::registry()
@@ -181,10 +236,7 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::new(config.rpc_url.clone(), config.rpc_timeout_secs);
 
     // `inspect` needs only RPC — handle it before touching the database.
-    if args.get(1).map(String::as_str) == Some("inspect") {
-        let contract_id = args
-            .get(2)
-            .context("usage: lumenqraph-indexer inspect <contract_id>")?;
+    if let Some(Command::Inspect { contract_id }) = &cli.command {
         return inspect(&rpc, contract_id).await;
     }
 
@@ -201,51 +253,6 @@ async fn main() -> anyhow::Result<()> {
         )))
         .connect(&config.database_url)
         .await
-        .context("failed to connect to Postgres")?;
+        .context("failed to con
 
-    // One-shot maintenance commands (`backfill`, `reenrich`, `deep-backfill`)
-    // must be runnable alongside a live indexer. Their writes are idempotent
-    // (`ON CONFLICT DO NOTHING`) and they never advance the live cursor, so
-    // they take neither the leader lock nor any other exclusive lock. Only the
-    // live poller elects a leader.
-    let subcommand = args.get(1).map(String::as_str);
-    let is_maintenance = matches!(subcommand, Some("backfill") | Some("reenrich") | Some("deep-backfill"));
-
-    // Migrations run under a short, separate migration lock so they are
-    // serialized across processes without contending on the leader lock.
-    run_migrations(&pool).await?;
-
-    if subcommand == Some("reenrich") {
-        info!("running in reenrich mode");
-        return reenrich::run_reenrich(pool.clone(), rpc, config).await;
-    }
-
-    if subcommand == Some("backfill") {
-        let from = args
-            .get(2)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(config.start_ledger);
-        info!(from, "running in backfill mode");
-        return backfill::run(pool.clone(), rpc, config, from).await;
-    }
-
-    // deep-backfill: ingest beyond the RPC retention window from a data-lake
-    // source. Parse manual args: --from, --to, --source, --input (repeatable).
-    if subcommand == Some("deep-backfill") {
-        return run_deep_backfill(args, pool.clone(), config).await;
-    }
-
-    // Live tail: elect a single active indexer via the leader lock. Others
-    // block here and become hot standbys that take over on failure.
-    debug_assert!(!is_maintenance);
-    let leader_lock = LeaderLock::acquire(&pool).await?;
-    leader_lock.spawn_keepalive();
-
-    let result = poller::run(pool.clone(), rpc, config).await;
-
-    // Release the lock by dropping the dedicated connection.
-    info!("releasing indexer leader lock");
-    drop(leader_lock);
-
-    result
-}
+/* … truncated 1941 chars — edit only what you need near the top … */
