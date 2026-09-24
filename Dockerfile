@@ -5,6 +5,12 @@ FROM rust:1-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
+# Copy the pinned toolchain first so rustup installs and selects the exact
+# Rust version declared in rust-toolchain.toml (matching CI) instead of the
+# floating toolchain baked into the base image.
+COPY rust-toolchain.toml ./
+RUN rustup show active-toolchain \
+    && rustc --version > /rustc-version.txt
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
@@ -26,6 +32,9 @@ COPY --from=builder /app/target/release/lumenqraph-indexer /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-api /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-webhooks /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-mcp /usr/local/bin/
+# Record the rustc version used to build the binaries so it is observable
+# from the image (e.g. `docker run --rm <image> cat /rustc-version.txt`).
+COPY --from=builder /rustc-version.txt /rustc-version.txt
 # Static explorer UI, served same-origin by the API (EXPLORER_DIR=/app/explorer).
 COPY explorer /app/explorer
 # Entrypoint for single-slot hosts that run the indexer + API as one process

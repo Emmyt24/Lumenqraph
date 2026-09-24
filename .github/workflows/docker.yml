@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
+      - 'rust-toolchain.toml'
       - 'crates/**'
       - 'migrations/**'
       - 'explorer/**'
@@ -14,6 +15,7 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - 'rust-toolchain.toml'
       - 'crates/**'
       - 'migrations/**'
       - 'explorer/**'
@@ -29,10 +31,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: |
+          CHANNEL=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml | head -n1 | sed -E 's/.*=[[:space:]]*"?([^"]+)"?.*/\1/')
+          if [ -z "$CHANNEL" ]; then
+            echo "ERROR: could not determine channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Pinned Rust toolchain channel: $CHANNEL"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-      
+
       - name: Build Docker image
         uses: docker/build-push-action@v7
         with:
@@ -43,25 +56,38 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ github.event.repository.updated_at }}
+            RUST_VERSION=${{ steps.toolchain.outputs.channel }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      
+
+      - name: Assert builder rustc matches rust-toolchain.toml
+        run: |
+          EXPECTED="${{ steps.toolchain.outputs.channel }}"
+          ACTUAL=$(docker run --rm --entrypoint rustc ${{ env.IMAGE_NAME }}:test --version)
+          echo "rust-toolchain.toml channel: $EXPECTED"
+          echo "builder rustc: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -q "$EXPECTED"; then
+            echo "ERROR: builder rustc ($ACTUAL) does not match rust-toolchain.toml ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ Builder rustc matches rust-toolchain.toml"
+
       - name: Smoke test - lumenqraph-api help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-api --help
-      
+
       - name: Smoke test - lumenqraph-indexer help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-indexer --help
-      
+
       - name: Smoke test - lumenqraph-webhooks help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-webhooks --help
-      
+
       - name: Smoke test - lumenqraph-mcp help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-mcp --help
-      
+
       - name: Verify non-root user
         run: |
           USER=$(docker run --rm ${{ env.IMAGE_NAME }}:test whoami)
