@@ -1,16 +1,17 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumenqraph"
 version = "0.1.0"
-description = "Lumenqraph Python SDK — a typed client over the Lumenqraph REST + GraphQL API"
+description = "Python SDK for LumenQraph"
 readme = "README.md"
-license = { file = "LICENSE" }
-authors = [{ name = "Lumen Scribe", email = "dev@lumenscribe.com" }]
 requires-python = ">=3.8"
-keywords = ["stellar", "soroban", "blockchain", "dapp", "lumenqraph"]
+license = { file = "LICENSE" }
+authors = [
+    { name = "LumenQraph" },
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -20,34 +21,30 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: Internet",
 ]
-# Zero runtime dependencies — stdlib only (urllib, asyncio, hmac, hashlib).
-dependencies = []
+dependencies = [
+    "httpx>=0.24",
+    "pydantic>=2.0",
+]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4",
-    "pytest-asyncio>=0.23",
-    "mypy>=1.5",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "build>=1.0",
+    "twine>=4.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Lumen-Scribe/Lumenqraph"
-Documentation = "https://github.com/Lumen-Scribe/Lumenqraph#python-sdk"
-"Source Code" = "https://github.com/Lumen-Scribe/Lumenqraph/tree/main/sdk/python"
-"Bug Reports" = "https://github.com/Lumen-Scribe/Lumenqraph/issues"
+Homepage = "https://github.com/lumenqraph/lumenqraph"
+Repository = "https://github.com/lumenqraph/lumenqraph"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["lumenqraph*"]
+[tool.setuptools]
+packages = ["lumenqraph"]
+
+[tool.setuptools.package-data]
+lumenqraph = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.mypy]
-python_version = "3.8"
-strict = true
-files = ["lumenqraph"]
