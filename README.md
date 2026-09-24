@@ -7,6 +7,7 @@
 Tail contract events from Soroban RPC, decode their XDR to clean JSON, store them in Postgres, and serve them over a plain REST API and signed webhooks — *curl and get JSON*, no VM or custom program to deploy.
 
 [![CI](https://github.com/Lumen-Scribe/Lumenqraph/actions/workflows/ci.yml/badge.svg)](https://github.com/Lumen-Scribe/Lumenqraph/actions/workflows/ci.yml)
+[![E2E](https://github.com/Lumen-Scribe/Lumenqraph/actions/workflows/e2e-test.yml/badge.svg)](https://github.com/Lumen-Scribe/Lumenqraph/actions/workflows/e2e-test.yml)
 [![Coverage](https://codecov.io/gh/Lumen-Scribe/Lumenqraph/branch/main/graph/badge.svg)](https://codecov.io/gh/Lumen-Scribe/Lumenqraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
