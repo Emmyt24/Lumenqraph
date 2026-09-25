@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
+      - 'rust-toolchain.toml'
       - 'crates/**'
       - 'migrations/**'
       - 'explorer/**'
@@ -14,6 +15,7 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - 'rust-toolchain.toml'
       - 'crates/**'
       - 'migrations/**'
       - 'explorer/**'
@@ -42,29 +44,43 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
+          load: true
           tags: ${{ env.IMAGE_NAME }}:test
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ github.event.repository.updated_at }}
+            RUST_VERSION=${{ steps.toolchain.outputs.channel }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      
+
+      - name: Assert builder rustc matches rust-toolchain.toml
+        run: |
+          EXPECTED="${{ steps.toolchain.outputs.channel }}"
+          ACTUAL=$(docker run --rm --entrypoint rustc ${{ env.IMAGE_NAME }}:test --version)
+          echo "rust-toolchain.toml channel: $EXPECTED"
+          echo "builder rustc: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -q "$EXPECTED"; then
+            echo "ERROR: builder rustc ($ACTUAL) does not match rust-toolchain.toml ($EXPECTED)"
+            exit 1
+          fi
+          echo "✓ Builder rustc matches rust-toolchain.toml"
+
       - name: Smoke test - lumenqraph-api help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-api --help
-      
+
       - name: Smoke test - lumenqraph-indexer help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-indexer --help
-      
+
       - name: Smoke test - lumenqraph-webhooks help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-webhooks --help
-      
+
       - name: Smoke test - lumenqraph-mcp help
         run: |
           docker run --rm ${{ env.IMAGE_NAME }}:test lumenqraph-mcp --help
-      
+
       - name: Verify non-root user
         run: |
           USER=$(docker run --rm ${{ env.IMAGE_NAME }}:test whoami)

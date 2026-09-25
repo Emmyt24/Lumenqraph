@@ -27,7 +27,19 @@ jobs:
         run: |
           echo "WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> $GITHUB_ENV
 
+      - name: Check testnet reachability
+        id: testnet
+        run: |
+          if curl -sf --max-time 10 https://soroban-testnet.stellar.org/health > /dev/null; then
+            echo "reachable=true" >> $GITHUB_OUTPUT
+            echo "Testnet is reachable."
+          else
+            echo "reachable=false" >> $GITHUB_OUTPUT
+            echo "::warning::Testnet RPC is unreachable; failures will be classified as external."
+          fi
+
       - name: Start full stack with docker-compose
+        id: build
         run: |
           docker compose -f docker-compose.full.yml up --build -d
         env:
@@ -46,17 +58,53 @@ jobs:
           docker compose -f docker-compose.full.yml logs --tail=50 api || true
 
       - name: Run smoke test
+        id: smoke
         run: bash scripts/e2e_smoke_test.sh
         env:
           API_URL: http://localhost:8080
 
       - name: Query API for data
+        id: api
         run: |
           echo "Testing GraphQL endpoint..."
           curl -sf http://localhost:8080/graphql -X POST \
             -H "content-type: application/json" \
             -d '{"query": "{ events(contractId: \"\") { edges { node { eventId } } } }"}' \
             | jq . || echo "GraphQL query failed (may be expected if no data indexed yet)"
+
+      - name: Classify failure
+        if: failure()
+        id: classify
+        run: |
+          if [ "${{ steps.testnet.outputs.reachable }}" = "false" ]; then
+            echo "classification=external" >> $GITHUB_OUTPUT
+            echo "::warning::E2E failure classified as EXTERNAL (testnet unreachable)."
+          else
+            echo "classification=pipeline" >> $GITHUB_OUTPUT
+            echo "::error::E2E failure classified as PIPELINE (our services are broken)."
+          fi
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          {
+            echo "## E2E Test Summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Testnet reachability | ${{ steps.testnet.outputs.reachable == 'true' && 'ok' || 'unreachable' }} |"
+            echo "| Build / start stack | ${{ steps.build.outcome || 'skipped' }} |"
+            echo "| Smoke test (migrate/index) | ${{ steps.smoke.outcome || 'skipped' }} |"
+            echo "| API assertion | ${{ steps.api.outcome || 'skipped' }} |"
+            echo ""
+            if [ "${{ steps.classify.outputs.classification }}" = "external" ]; then
+              echo "**Classification:** external (testnet unreachable)"
+            elif [ "${{ steps.classify.outputs.classification }}" = "pipeline" ]; then
+              echo "**Classification:** pipeline (our services are broken)"
+            else
+              echo "**Classification:** none (run succeeded)"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Collect logs on failure
         if: failure()
@@ -71,3 +119,52 @@ jobs:
       - name: Clean up
         if: always()
         run: docker compose -f docker-compose.full.yml down -v
+
+  notify-failure:
+    name: Open tracking issue on scheduled failure
+    needs: e2e-test
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update tracking issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const title = 'Scheduled E2E test failing on main';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              'The scheduled End-to-End Test workflow failed on `main`.',
+              '',
+              `- Run: ${runUrl}`,
+              `- Commit: ${context.sha}`,
+              '',
+              'See the workflow summary for the failing stage (build, migrate, index, API assertion) and the failure classification (external vs pipeline).',
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'e2e-failure',
+            });
+
+            if (existing.data.length > 0) {
+              const issue = existing.data[0];
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['e2e-failure'],
+              });
+            }
