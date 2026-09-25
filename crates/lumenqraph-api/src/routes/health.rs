@@ -37,11 +37,19 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             "network": network,
             "network_passphrase": passphrase,
             "mounts": mounts,
+            "unrecovered_missed_ranges": 0,
             "version": state.build_info.version,
             "commit": state.build_info.commit,
             "build_time": state.build_info.build_time,
         })));
     };
+
+    let unrecovered_missed_ranges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM missed_ranges WHERE recovered_at IS NULL",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
 
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
@@ -59,6 +67,7 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "seconds_since_cursor_update": secs_since_update,
         "events_ingested_total": ingested,
         "errors_total": errors,
+        "unrecovered_missed_ranges": unrecovered_missed_ranges,
         "version": state.build_info.version,
         "commit": state.build_info.commit,
         "build_time": state.build_info.build_time,

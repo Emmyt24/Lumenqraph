@@ -62,6 +62,7 @@ The two paths write to the same tables. `INSERT … ON CONFLICT DO NOTHING` on
 | Source | Flag | Description |
 |---|---|---|
 | Galexie / Stellar CDP | `--source galexie` | Newline-delimited JSON export |
+| Stellar Horizon | `--source horizon` | Historical events from Horizon `/transactions` endpoint |
 
 New sources can be added by implementing the `HistoricalSource` trait in
 `crates/lumenqraph-indexer/src/deep_backfill.rs`.
@@ -109,7 +110,80 @@ gsutil cat gs://my-bucket/events-*.ndjson | \
   ./target/release/lumenqraph-indexer deep-backfill \
     --from 1000000 \
     --input -
+
+# From a Horizon endpoint:
+./target/release/lumenqraph-indexer deep-backfill \
+  --from   1000000 \
+  --to     2000000 \
+  --source horizon \
+  --input  https://horizon.stellar.org
 ```
+
+## HistoricalSource Trait Contract
+
+Any historical ingest provider implements the `HistoricalSource` trait defined in `crates/lumenqraph-indexer/src/deep_backfill.rs`:
+
+```rust
+pub trait HistoricalSource: Send + Sync {
+    /// Collect all events in `[from_ledger, to_ledger]` into `out`.
+    ///
+    /// Implementations should stream data and keep memory bounded.
+    fn collect_range<'a>(
+        &'a self,
+        from_ledger: i64,
+        to_ledger: i64,
+        contract_ids: &'a [String],
+        out: &'a mut Vec<HistoricalEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
+}
+```
+
+### Event Shape: `HistoricalEvent`
+
+Each event collected must populate `HistoricalEvent`:
+
+```rust
+pub struct HistoricalEvent {
+    pub event_id: String,
+    pub contract_id: String,
+    pub ledger: i64,
+    pub ledger_closed_at: DateTime<Utc>,
+    pub event_type: String,
+    pub topics: Vec<String>,     // Base64 XDR ScVal strings
+    pub value: String,          // Base64 XDR ScVal string
+    pub tx_hash: String,
+    pub in_successful_call: bool,
+    pub paging_token: String,
+}
+```
+
+- **Ascending order:** Events returned in `out` must be ordered by ledger sequence in ascending order.
+- **Contract filtering:** When `contract_ids` is non-empty, only events belonging to one of the specified contracts should be collected. When empty, all contract events are collected.
+- **Idempotency:** Inserts into Postgres are executed with `ON CONFLICT (event_id) DO NOTHING`. Even if a source returns duplicate events or overlaps with the live poller, storage is idempotent.
+
+## Extension Guide: Writing a New Source
+
+To implement an archive source (e.g. Horizon, Stellar Core DB, BigQuery, AWS S3 / GCS bucket):
+
+1. **Define your source struct:**
+   Store configuration such as database connection pools, HTTP client endpoints, or credentials.
+2. **Implement `HistoricalSource`:**
+   In `collect_range`, query your storage layer for ledgers between `from_ledger` and `to_ledger`.
+3. **Handle Pagination and Memory:**
+   When reading from APIs or large dumps, iterate through pages or record streams using cursors, appending matching events to `out`. Stop once `to_ledger` is reached.
+4. **Register in CLI:**
+   Add your source variant to `run_deep_backfill` in `crates/lumenqraph-indexer/src/main.rs`.
+
+## Reference Implementations
+
+Lumenqraph provides two reference implementations:
+
+### 1. `GalexieSource` (Data-Lake NDJSON Exports)
+Reads newline-delimited JSON exports produced by Galexie or stellar-etl. Supports both native per-ledger envelopes and flat per-event records. Stream-reads from files or stdin (`--input -`).
+
+### 2. `HorizonSource` (REST API Client)
+Connects to a Stellar Horizon endpoint (e.g. `https://horizon.stellar.org/transactions`), paginates through transactions via HTTP query parameters (`order=asc`, `limit=200`, `cursor=...`), extracts contract events, and filters them against the requested ledger and contract bounds.
+
 
 ## Seam / hand-off to the live poller
 
