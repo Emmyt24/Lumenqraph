@@ -23,6 +23,7 @@
 //! | Source | Type | Description |
 //! |---|---|---|
 //! | [`GalexieSource`] | File / stdin | Reads a Galexie / Stellar CDP export in newline-delimited JSON |
+//! | [`HorizonSource`] | HTTP REST API | Reads historical events from Horizon's `/transactions` endpoint |
 //!
 //! # Adding a new source
 //!
@@ -365,6 +366,194 @@ impl HistoricalSource for GalexieSource {
 }
 
 // ---------------------------------------------------------------------------
+// Horizon source
+// ---------------------------------------------------------------------------
+
+/// Fetch historical events from the Horizon `/transactions` endpoint.
+///
+/// This serves as a secondary reference implementation of [`HistoricalSource`],
+/// demonstrating how to stream events from an HTTP REST API with cursor pagination.
+pub struct HorizonSource {
+    pub base_url: String,
+    pub client: reqwest::Client,
+    pub page_limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct HorizonResponse {
+    _embedded: HorizonEmbedded,
+}
+
+#[derive(Debug, Deserialize)]
+struct HorizonEmbedded {
+    records: Vec<HorizonTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HorizonTransaction {
+    id: Option<String>,
+    hash: Option<String>,
+    ledger: i64,
+    created_at: Option<String>,
+    #[serde(default = "default_true")]
+    successful: bool,
+    #[serde(default)]
+    paging_token: String,
+    #[serde(default)]
+    events: Option<Vec<HorizonEvent>>,
+    #[serde(default)]
+    diagnostic_events: Option<Vec<HorizonEvent>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HorizonEvent {
+    id: Option<String>,
+    contract_id: Option<String>,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    topic: Vec<String>,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default)]
+    value: String,
+    #[serde(default = "default_true")]
+    in_successful_contract_call: bool,
+    #[serde(default)]
+    paging_token: Option<String>,
+}
+
+impl HorizonSource {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            client: reqwest::Client::new(),
+            page_limit: 200,
+        }
+    }
+
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.page_limit = limit;
+        self
+    }
+}
+
+impl HistoricalSource for HorizonSource {
+    fn collect_range<'a>(
+        &'a self,
+        from_ledger: i64,
+        to_ledger: i64,
+        contract_ids: &'a [String],
+        out: &'a mut Vec<HistoricalEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut next_cursor: Option<String> = None;
+
+            loop {
+                let limit_str = self.page_limit.to_string();
+                let mut req = self
+                    .client
+                    .get(format!("{}/transactions", self.base_url.trim_end_matches('/')))
+                    .query(&[("order", "asc"), ("limit", limit_str.as_str())]);
+
+                if let Some(ref c) = next_cursor {
+                    req = req.query(&[("cursor", c.as_str())]);
+                }
+
+                let res = req
+                    .send()
+                    .await
+                    .context("failed to query Horizon /transactions")?;
+
+                if !res.status().is_success() {
+                    anyhow::bail!("Horizon returned HTTP error: {}", res.status());
+                }
+
+                let page: HorizonResponse = res
+                    .json()
+                    .await
+                    .context("failed to parse Horizon /transactions response")?;
+
+                let records = page._embedded.records;
+                if records.is_empty() {
+                    break;
+                }
+
+                let mut reached_end = false;
+
+                for tx in records {
+                    if !tx.paging_token.is_empty() {
+                        next_cursor = Some(tx.paging_token.clone());
+                    }
+
+                    if tx.ledger < from_ledger {
+                        continue;
+                    }
+                    if tx.ledger > to_ledger {
+                        reached_end = true;
+                        break;
+                    }
+
+                    let tx_hash = tx
+                        .hash
+                        .clone()
+                        .or_else(|| tx.id.clone())
+                        .unwrap_or_default();
+                    let close_time = tx
+                        .created_at
+                        .as_deref()
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                        .unwrap_or_else(Utc::now);
+
+                    let events = tx.events.or(tx.diagnostic_events).unwrap_or_default();
+                    for (idx, e) in events.into_iter().enumerate() {
+                        let contract_id = match e.contract_id {
+                            Some(cid) => cid,
+                            None => continue,
+                        };
+                        if !contract_ids.is_empty() && !contract_ids.contains(&contract_id) {
+                            continue;
+                        }
+
+                        let topics = if !e.topics.is_empty() {
+                            e.topics
+                        } else {
+                            e.topic
+                        };
+                        let event_id = e.id.unwrap_or_else(|| format!("{tx_hash}-{idx}"));
+                        let paging_token = e.paging_token.unwrap_or_else(|| event_id.clone());
+
+                        out.push(HistoricalEvent {
+                            event_id,
+                            contract_id,
+                            ledger: tx.ledger,
+                            ledger_closed_at: close_time,
+                            event_type: e.event_type.unwrap_or_else(|| "contract".into()),
+                            topics,
+                            value: e.value,
+                            tx_hash: tx_hash.clone(),
+                            in_successful_call: tx.successful && e.in_successful_contract_call,
+                            paging_token,
+                        });
+                    }
+                }
+
+                if reached_end || next_cursor.is_none() {
+                    break;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -656,5 +845,57 @@ mod tests {
         };
         let new_ev = historical_to_new_event(ev, None);
         assert_eq!(new_ev.paging_token, "custom-paging");
+    }
+
+    #[tokio::test]
+    async fn horizon_source_collect_range_with_mock_server() {
+        let app = axum::Router::new().route(
+            "/transactions",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "_embedded": {
+                        "records": [
+                            {
+                                "id": "tx1",
+                                "hash": "0xabc",
+                                "ledger": 105,
+                                "created_at": "2024-01-01T00:00:00Z",
+                                "successful": true,
+                                "paging_token": "pt1",
+                                "events": [
+                                    {
+                                        "id": "ev1",
+                                        "contract_id": "CA1",
+                                        "type": "contract",
+                                        "topic": ["AAAA"],
+                                        "value": "BBBB",
+                                        "in_successful_contract_call": true
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let source = HorizonSource::new(format!("http://{addr}"));
+        let mut out = Vec::new();
+        source
+            .collect_range(100, 200, &[], &mut out)
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event_id, "ev1");
+        assert_eq!(out[0].contract_id, "CA1");
+        assert_eq!(out[0].ledger, 105);
+        assert_eq!(out[0].tx_hash, "0xabc");
     }
 }
