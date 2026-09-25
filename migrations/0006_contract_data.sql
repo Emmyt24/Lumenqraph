@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS contract_data (
     -- Optional discovery label, e.g. 'balance', for grouping/filtering.
     label        TEXT,
     captured_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (contract_id, key_hash, ledger)
+    PRIMARY KEY (contract_id, key_hash, ledger),
+    CONSTRAINT uq_contract_data_contract_key_ledger UNIQUE (contract_id, key_hash, ledger)
 );
 
 -- "latest value for a key" and "a key's history" both want newest-first.

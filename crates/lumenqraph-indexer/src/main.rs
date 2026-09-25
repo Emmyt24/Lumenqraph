@@ -5,13 +5,14 @@
 //!   lumenqraph-indexer                    # live tail (default)
 //!   lumenqraph-indexer backfill [LEDGER]  # one-shot catch-up within RPC window (~7 days) then exit
 //!   lumenqraph-indexer deep-backfill [OPTIONS]  # gapless history from a data-lake export (#84)
+//!   lumenqraph-indexer recover-gaps       # replay all recorded missed ranges (#295)
 //!   lumenqraph-indexer reenrich          # re-enrich historical events with newly-available specs
 //!   lumenqraph-indexer inspect <CONTRACT> # print a contract's on-chain interface
 //!
 //! deep-backfill options:
 //!   --from <LEDGER>   Start ledger (required)
 //!   --to   <LEDGER>   End ledger   (default: max / run to EOF of input)
-//!   --source <TYPE>   Source type: galexie (default: galexie)
+//!   --source <TYPE>   Source type: galexie, horizon (default: galexie)
 //!   --input <PATH>    Input file(s); use '-' for stdin; may be repeated
 
 mod backfill;
@@ -167,6 +168,21 @@ async fn main() -> anyhow::Result<()> {
             .execute(&pool)
             .await;
         
+        return result;
+    }
+
+    if args.get(1).map(String::as_str) == Some("recover-gaps") {
+        info!("running in recover-gaps mode");
+        let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+        let result = poller::recover_gaps(&pool, &rpc, &config, &specs).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
         return result;
     }
 
@@ -336,8 +352,16 @@ async fn run_deep_backfill(
 
     let source: Box<dyn HistoricalSource> = match source_type.as_str() {
         "galexie" => Box::new(GalexieSource::new(inputs)),
+        "horizon" => {
+            let base_url = inputs
+                .first()
+                .and_then(|p| p.to_str())
+                .filter(|s| *s != "-")
+                .unwrap_or("https://horizon.stellar.org");
+            Box::new(deep_backfill::HorizonSource::new(base_url))
+        }
         other => anyhow::bail!(
-            "unknown source type '{other}'; supported: galexie"
+            "unknown source type '{other}'; supported: galexie, horizon"
         ),
     };
 
