@@ -27,13 +27,19 @@ pub use models::{
     ApiKey,
     AmmSwap,
     Contract,
+    ContractDurability,
     EventRow,
+    EventType,
     IndexerStatus,
     LiquidityEvent,
+    LiquidityEventKind,
     NewEvent,
     NftEvent,
+    NftEventKind,
     TokenTransfer,
+    WebhookDeliveryStatus,
     WebhookSubscription,
+    WebhookSubscriptionKind,
 };
 pub use spec::ContractSpec;
 pub use xdr::is_valid_contract_id;

@@ -191,3 +191,41 @@ macro_rules! require_db {
         }
     };
 }
+
+/// Assert that a CHECK constraint named `constraint` exists on `table` in the
+/// current schema. Used by the enum-column constraint tests to verify the
+/// migration from #365 actually installed the constraint.
+pub async fn assert_check_constraint(pool: &PgPool, table: &str, constraint: &str) {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE c.contype = 'c' \
+               AND t.relname = $1 \
+               AND c.conname = $2 \
+               AND n.nspname = current_schema()\
+         )",
+    )
+    .bind(table)
+    .bind(constraint)
+    .fetch_one(pool)
+    .await
+    .expect("query pg_constraint");
+
+    assert!(
+        exists,
+        "expected CHECK constraint {constraint} on {table} to exist"
+    );
+}
+
+/// Assert that inserting `value` into `table.column` is rejected by the
+/// database. The caller supplies a full INSERT statement so the test can
+/// satisfy any NOT NULL columns; the value is bound as `$1`.
+pub async fn assert_insert_rejected(pool: &PgPool, insert_sql: &str, value: &str) {
+    let result = sqlx::query(insert_sql).bind(value).execute(pool).await;
+    assert!(
+        result.is_err(),
+        "expected insert of {value:?} to be rejected, but it succeeded"
+    );
+}

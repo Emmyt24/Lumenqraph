@@ -106,6 +106,36 @@ Response:
 }
 ```
 
+### `GET /contracts/:id/stats`
+Aggregated time-series event statistics for a contract, bucketed by a specified time resolution or ledger using Postgres `date_trunc`.
+
+**Query parameters:**
+- `resolution`: Time bucket granularity — `1m`, `1h`, `1d`, `1w`, or `1M` (also accepts `hour`, `day`). Default is `1d`.
+- `window`: Relative lookback time window from now — e.g. `1h`, `24h`, `7d`, `30d`. Supported units: `m`, `h`, `d`, `w`.
+- `bucket`: Alternative bucketing parameter (`hour`, `day`, `ledger`).
+- `group_by`: Optional grouping (`event_name`) to split counts per event type.
+- `from`: Minimum RFC3339 timestamp (inclusive).
+- `to`: Maximum RFC3339 timestamp (inclusive).
+- `from_ledger`: Minimum ledger sequence (inclusive).
+- `to_ledger`: Maximum ledger sequence (inclusive).
+
+Response:
+```json
+{
+  "data": [
+    {
+      "bucket": "2026-07-15 12:00:00+00",
+      "count": 142,
+      "breakdown": {
+        "transfer": 120,
+        "mint": 22
+      }
+    }
+  ],
+  "total": 142
+}
+```
+
 ### `GET /events/:event_id`
 Fetch a **single** event by its unique `event_id`. Returns the full event row
 (raw XDR, decoded JSON, and enriched record); `404` if no event with that id is
