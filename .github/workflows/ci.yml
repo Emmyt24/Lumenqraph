@@ -15,6 +15,24 @@ permissions:
   contents: read
 
 jobs:
+  # Issue #361: sqlx keys migrations by integer version and
+  # `_sqlx_migrations.version` is the primary key, so two files sharing a
+  # numeric prefix cannot both be recorded. Fail fast if any duplicate
+  # version prefix exists in migrations/.
+  migration-versions:
+    name: Migration Version Uniqueness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject duplicate migration version prefixes
+        run: |
+          dups=$(ls migrations | cut -d_ -f1 | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            echo "Duplicate migration version prefixes found:"
+            echo "$dups"
+            exit 1
+          fi
+
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check
