@@ -8,6 +8,71 @@ use sqlx::types::Json;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+/// The kind of a Soroban contract event, mirroring the `events.event_type`
+/// CHECK constraint ("contract" | "system" | "diagnostic").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum EventType {
+    Contract,
+    System,
+    Diagnostic,
+}
+
+/// The kind of a materialized NFT event, mirroring the `nft_events.event_kind`
+/// CHECK constraint ("mint" | "transfer" | "burn").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum NftEventKind {
+    Mint,
+    Transfer,
+    Burn,
+}
+
+/// The kind of a materialized liquidity event, mirroring the
+/// `liquidity_events.event_kind` CHECK constraint ("add" | "remove").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum LiquidityEventKind {
+    Add,
+    Remove,
+}
+
+/// The delivery status of a webhook, mirroring the
+/// `webhook_deliveries.status` CHECK constraint
+/// ("pending" | "delivered" | "failed").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookDeliveryStatus {
+    Pending,
+    Delivered,
+    Failed,
+}
+
+/// What a webhook subscription fires on, mirroring the
+/// `webhook_subscriptions.kind` CHECK constraint ("event" | "upgrade").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookSubscriptionKind {
+    Event,
+    Upgrade,
+}
+
+/// The durability of a contract data entry, mirroring the
+/// `contract_data.durability` CHECK constraint
+/// ("persistent" | "temporary").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ContractDataDurability {
+    Persistent,
+    Temporary,
+}
+
 /// A decoded Soroban contract event, ready to be inserted.
 ///
 /// We keep both the raw base64 XDR (`topics`, `value` — lossless) and the
@@ -20,7 +85,7 @@ pub struct NewEvent {
     pub ledger: i64,
     pub ledger_closed_at: DateTime<Utc>,
     /// "contract" | "system" | "diagnostic"
-    pub event_type: String,
+    pub event_type: EventType,
     /// Raw base64 XDR topics, in order.
     pub topics: Vec<String>,
     /// Decoded topics as JSON, in order.
@@ -46,7 +111,7 @@ pub struct EventRow {
     pub contract_id: String,
     pub ledger: i64,
     pub ledger_closed_at: DateTime<Utc>,
-    pub event_type: String,
+    pub event_type: EventType,
     pub topics: Json<Vec<String>>,
     pub decoded_topics: Json<Value>,
     pub event_name: Option<String>,
@@ -118,7 +183,7 @@ pub struct AmmSwap {
 pub struct NftEvent {
     pub event_id: String,
     pub contract_id: String,
-    pub event_kind: String,
+    pub event_kind: NftEventKind,
     pub from_addr: Option<String>,
     pub to_addr: Option<String>,
     pub token_id: String,
@@ -131,7 +196,7 @@ pub struct NftEvent {
 pub struct LiquidityEvent {
     pub event_id: String,
     pub contract_id: String,
-    pub event_kind: String,
+    pub event_kind: LiquidityEventKind,
     pub provider: Option<String>,
     pub amount_a: Option<String>,
     pub amount_b: Option<String>,
@@ -149,7 +214,7 @@ pub struct WebhookSubscription {
     pub url: String,
     /// What this subscription fires on: `"event"` (an indexed contract event) or
     /// `"upgrade"` (the contract's on-chain interface changed).
-    pub kind: String,
+    pub kind: WebhookSubscriptionKind,
     /// Filter: only events from this contract (None = any).
     pub contract_id: Option<String>,
     /// Filter: only events with this name (None = any). Ignored by `upgrade`

@@ -755,3 +755,8 @@ Licensed under the [MIT License](LICENSE).
 <div align="center">
 Built for the <a href="https://stellar.org/soroban">Stellar / Soroban</a> ecosystem.
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-364 -->
+- #364: Migration 0019 is a silent no-op on existing databases: `idx_events_enriched` already exists from 0004
