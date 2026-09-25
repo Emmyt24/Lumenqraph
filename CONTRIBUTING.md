@@ -125,6 +125,16 @@ To update schema objects like triggers (`contract_summaries`), edit the relevant
 - Keep raw base64 alongside any decoded representation; decoding is best-effort
   and must never break ingestion.
 
+## Minimum Supported Rust Version (MSRV)
+
+The Minimum Supported Rust Version (MSRV) for Lumenqraph is **1.84**.
+
+The MSRV is declared in `Cargo.toml` (`rust-version`) and pinned in `rust-toolchain.toml`. Our policy is to support at least the latest stable Rust release minus two versions (stable - 2). When upgrading the MSRV:
+- Update `rust-version` in `Cargo.toml`.
+- Update `channel` in `rust-toolchain.toml`.
+- Ensure CI (`msrv-check` job in `.github/workflows/ci.yml`) passes.
+- Document any dependency or std feature requirements motivating the bump.
+
 ## Security Considerations
 
 When contributing code, especially around authentication, cryptography, or sensitive data:
