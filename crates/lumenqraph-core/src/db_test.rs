@@ -42,6 +42,10 @@ impl TestDb {
         let url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set to run Postgres-backed tests");
 
+        // Refuse to run against a database that doesn't look like a test DB.
+        // This prevents accidentally wiping a developer's dev database.
+        assert_test_database(&url);
+
         // Use a UUID so concurrent tests never collide on the schema name.
         let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
 
@@ -118,6 +122,36 @@ pub fn database_url() -> Option<String> {
     std::env::var("TEST_DATABASE_URL").ok()
 }
 
+/// Guard: refuse to run destructive DB tests against a database whose name
+/// does not contain `test`. This prevents `make test-db` (or a stray
+/// `TEST_DATABASE_URL`) from wiping a developer's dev database.
+fn assert_test_database(url: &str) {
+    let db_name = database_name(url);
+    assert!(
+        db_name.to_ascii_lowercase().contains("test"),
+        "refusing to run destructive DB tests against database `{db_name}`: \
+         the database name must contain `test` (set TEST_DATABASE_URL to a \
+         dedicated test database, e.g. lumenqraph_test)"
+    );
+}
+
+/// Extract the database name from a Postgres connection URL.
+///
+/// Handles `postgres://user:pass@host:port/dbname?params` and returns the
+/// path segment (without the leading slash). Falls back to an empty string
+/// when no database name is present.
+fn database_name(url: &str) -> String {
+    // Strip the scheme (everything up to and including `://`).
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    // Drop any query string.
+    let without_query = after_scheme.split('?').next().unwrap_or(after_scheme);
+    // The database name is the path segment after the first `/`.
+    match without_query.split_once('/') {
+        Some((_, db)) => db.to_string(),
+        None => String::new(),
+    }
+}
+
 /// Append (or replace) the `search_path` option in a Postgres connection URL.
 ///
 /// If the URL already has a `search_path` query parameter it is replaced.
@@ -156,4 +190,42 @@ macro_rules! require_db {
             return;
         }
     };
+}
+
+/// Assert that a CHECK constraint named `constraint` exists on `table` in the
+/// current schema. Used by the enum-column constraint tests to verify the
+/// migration from #365 actually installed the constraint.
+pub async fn assert_check_constraint(pool: &PgPool, table: &str, constraint: &str) {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE c.contype = 'c' \
+               AND t.relname = $1 \
+               AND c.conname = $2 \
+               AND n.nspname = current_schema()\
+         )",
+    )
+    .bind(table)
+    .bind(constraint)
+    .fetch_one(pool)
+    .await
+    .expect("query pg_constraint");
+
+    assert!(
+        exists,
+        "expected CHECK constraint {constraint} on {table} to exist"
+    );
+}
+
+/// Assert that inserting `value` into `table.column` is rejected by the
+/// database. The caller supplies a full INSERT statement so the test can
+/// satisfy any NOT NULL columns; the value is bound as `$1`.
+pub async fn assert_insert_rejected(pool: &PgPool, insert_sql: &str, value: &str) {
+    let result = sqlx::query(insert_sql).bind(value).execute(pool).await;
+    assert!(
+        result.is_err(),
+        "expected insert of {value:?} to be rejected, but it succeeded"
+    );
 }

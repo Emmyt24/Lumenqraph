@@ -17,6 +17,20 @@ cargo run -p lumenqraph-api
 
 ## Before you push
 
+Run the aggregate CI target to reproduce what CI checks locally (minus the
+network-dependent E2E suite):
+
+```bash
+make ci
+```
+
+This runs `cargo fmt`, `cargo clippy`, the unit tests, the TypeScript and Python
+SDK checks, the OpenAPI drift check, and `cargo deny`. Run `make help` to see
+all available targets, including the individual steps (`fmt`, `lint`, `test`,
+`sdk-ts`, `sdk-py`, `openapi-check`, `deny`, `audit`, `dashboards-check`).
+
+If you prefer to run the steps by hand:
+
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
@@ -124,6 +138,16 @@ To update schema objects like triggers (`contract_summaries`), edit the relevant
   applied migration.
 - Keep raw base64 alongside any decoded representation; decoding is best-effort
   and must never break ingestion.
+
+## Minimum Supported Rust Version (MSRV)
+
+The Minimum Supported Rust Version (MSRV) for Lumenqraph is **1.84**.
+
+The MSRV is declared in `Cargo.toml` (`rust-version`) and pinned in `rust-toolchain.toml`. Our policy is to support at least the latest stable Rust release minus two versions (stable - 2). When upgrading the MSRV:
+- Update `rust-version` in `Cargo.toml`.
+- Update `channel` in `rust-toolchain.toml`.
+- Ensure CI (`msrv-check` job in `.github/workflows/ci.yml`) passes.
+- Document any dependency or std feature requirements motivating the bump.
 
 ## Security Considerations
 

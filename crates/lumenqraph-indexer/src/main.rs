@@ -5,13 +5,14 @@
 //!   lumenqraph-indexer                    # live tail (default)
 //!   lumenqraph-indexer backfill [LEDGER]  # one-shot catch-up within RPC window (~7 days) then exit
 //!   lumenqraph-indexer deep-backfill [OPTIONS]  # gapless history from a data-lake export (#84)
+//!   lumenqraph-indexer recover-gaps       # replay all recorded missed ranges (#295)
 //!   lumenqraph-indexer reenrich          # re-enrich historical events with newly-available specs
 //!   lumenqraph-indexer inspect <CONTRACT> # print a contract's on-chain interface
 //!
 //! deep-backfill options:
 //!   --from <LEDGER>   Start ledger (required)
 //!   --to   <LEDGER>   End ledger   (default: max / run to EOF of input)
-//!   --source <TYPE>   Source type: galexie (default: galexie)
+//!   --source <TYPE>   Source type: galexie, horizon (default: galexie)
 //!   --input <PATH>    Input file(s); use '-' for stdin; may be repeated
 //!
 //! Concurrency model:
@@ -160,8 +161,84 @@ impl LeaderLock {
         let mut conn = pool
             .acquire()
             .await
-            .context("failed to acquire dedicated connection for leader lock")?
-            .detach();
+            .context("failed to acquire advisory lock (blocking)")?;
+    }
+
+    info!("indexer leader lock acquired; this instance is now active");
+
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("failed to run migrations")?;
+
+    if args.get(1).map(String::as_str) == Some("reenrich") {
+        info!("running in reenrich mode");
+        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    if args.get(1).map(String::as_str) == Some("backfill") {
+        let from = args
+            .get(2)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(config.start_ledger);
+        info!(from, "running in backfill mode");
+        let result = backfill::run(pool.clone(), rpc, config, from).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    // deep-backfill: ingest beyond the RPC retention window from a data-lake
+    // source. Parse manual args: --from, --to, --source, --input (repeatable).
+    if args.get(1).map(String::as_str) == Some("deep-backfill") {
+        let result = run_deep_backfill(args, pool.clone(), config).await;
+        
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+        
+        return result;
+    }
+
+    if args.get(1).map(String::as_str) == Some("recover-gaps") {
+        info!("running in recover-gaps mode");
+        let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+        let result = poller::recover_gaps(&pool, &rpc, &config, &specs).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    info!(
+        rpc = %config.rpc_url,
+        contracts = ?config.contract_ids,
+        poll_secs = config.poll_interval_secs,
+        "starting lumenqraph indexer (live)"
+    );
 
         info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
@@ -220,11 +297,19 @@ async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .context("failed to acquire dedicated connection for migration lock")?
         .detach();
 
-    info!("acquiring migration lock (id {})", MIGRATION_LOCK_ID);
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_LOCK_ID)
-        .execute(&mut *conn)
-        .await
-        
+    let source: Box<dyn HistoricalSource> = match source_type.as_str() {
+        "galexie" => Box::new(GalexieSource::new(inputs)),
+        "horizon" => {
+            let base_url = inputs
+                .first()
+                .and_then(|p| p.to_str())
+                .filter(|s| *s != "-")
+                .unwrap_or("https://horizon.stellar.org");
+            Box::new(deep_backfill::HorizonSource::new(base_url))
+        }
+        other => anyhow::bail!(
+            "unknown source type '{other}'; supported: galexie, horizon"
+        ),
+    };
 
 /* … truncated 1692 chars — edit only what you need near the top … */

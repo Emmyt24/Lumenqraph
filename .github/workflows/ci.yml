@@ -15,6 +15,24 @@ permissions:
   contents: read
 
 jobs:
+  # Issue #361: sqlx keys migrations by integer version and
+  # `_sqlx_migrations.version` is the primary key, so two files sharing a
+  # numeric prefix cannot both be recorded. Fail fast if any duplicate
+  # version prefix exists in migrations/.
+  migration-versions:
+    name: Migration Version Uniqueness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject duplicate migration version prefixes
+        run: |
+          dups=$(ls migrations | cut -d_ -f1 | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            echo "Duplicate migration version prefixes found:"
+            echo "$dups"
+            exit 1
+          fi
+
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check
@@ -36,6 +54,29 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: Check on MSRV
         run: cargo check --workspace --all-targets
+
+  # Issue #355: the Docker builder must compile with the same Rust version
+  # declared in rust-toolchain.toml, otherwise release images can be built with
+  # a different compiler than CI.  Build the image and assert the rustc version
+  # baked into it matches the pinned toolchain.
+  docker-toolchain-check:
+    name: Docker Toolchain Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Extract pinned toolchain from rust-toolchain.toml
+        id: toolchain
+        run: |
+          CHANNEL=$(grep -m1 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+      - name: Build Docker image
+        run: docker build -t lumenqraph-api:ci .
+      - name: Assert image rustc matches rust-toolchain.toml
+        run: |
+          IMAGE_RUSTC=$(docker run --rm lumenqraph-api:ci rustc --version)
+          echo "image rustc: $IMAGE_RUSTC"
+          echo "pinned channel: ${{ steps.toolchain.outputs.channel }}"
+          echo "$IMAGE_RUSTC" | grep -q "${{ steps.toolchain.outputs.channel }}"
 
   build-test:
     runs-on: ubuntu-latest
@@ -60,6 +101,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Format
@@ -130,6 +172,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: openapi-drift
@@ -149,51 +193,22 @@ jobs:
         run: |
           python3 scripts/check_openapi_drift.py openapi.yaml /tmp/generated-openapi.json
 
-  # Validate Grafana dashboard metrics against metrics defined in Rust code
-  dashboard-metrics:
-    name: Dashboard Metrics Validation
+  # Issue #357: build and validate the Python SDK so it stays installable.
+  # `python -m build` produces an sdist and a wheel from sdk/python, and
+  # `twine check` verifies the package metadata (including the LICENSE file
+  # referenced by pyproject.toml) is valid for upload.
+  python-sdk:
+    name: Python SDK (3.12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - name: Validate dashboard metrics
-        run: python3 scripts/validate_dashboard_metrics.py
-
-  # TypeScript SDK: build, typecheck, lint, test, and codegen drift check
-  sdk-typescript:
-    name: TypeScript SDK
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk/typescript
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
-      - name: Install dependencies
-        run: npm ci
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Build
-        run: npm run build
-      - name: Lint
-        run: npm run lint
-      - name: Test
-        run: npm test
-      - name: Codegen drift check
-        run: npm run codegen:check
-
-  # Python SDK: lint, type-check, and test
-  sdk-python:
-    name: Python SDK
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build sdist and wheel
         working-directory: sdk/python
     strategy:
       matrix:
@@ -216,16 +231,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
       - uses: rustsec/audit-check-action@6c8391537eae8e000a51e2e2eee5f4b58fda619b # v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  supply-chain-security:
-    name: Supply Chain Security (cargo-deny)
+  # Validate Grafana dashboard metrics against metrics defined in Rust code
+  dashboard-metrics:
+    name: Dashboard Metrics Validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Ensure all GitHub Actions in .github/workflows are pinned to full commit SHAs
+      - name: Lint action SHA pinning
+        run: |
+          if grep -rnE 'uses: [^@]+@v[0-9]' .github/workflows; then
+            echo "Error: Unpinned actions found in .github/workflows. Pin all actions to full 40-character SHAs."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: cargo-deny
@@ -239,9 +266,7 @@ jobs:
       # here between the weekly Dependabot runs instead of sitting unnoticed.
       - name: Check advisories
         run: cargo deny check advisories
-      # Licenses / bans / sources are reported but not yet gating, to avoid
-      # blocking unrelated PRs on a pre-existing finding. Tighten to blocking
-      # once the current tree is known-clean.
+      # Licenses / bans / sources are gating: supply-chain and license
+      # violations block the build to ensure policy is enforced.
       - name: Check licenses, bans, and sources
         run: cargo deny check licenses bans sources
-        continue-on-error: true

@@ -111,6 +111,28 @@ export interface EventsResponse {
   next_cursor: string | null;
 }
 
+export interface StatsBucket {
+  bucket: string;
+  count: number;
+  breakdown?: Record<string, number>;
+}
+
+export interface StatsResponse {
+  data: StatsBucket[];
+  total: number;
+}
+
+export interface GetStatsOptions extends RequestOptions {
+  resolution?: "1m" | "1h" | "1d" | "1w" | "1M" | "hour" | "day" | string;
+  window?: string;
+  bucket?: "hour" | "day" | "ledger" | string;
+  groupBy?: "event_name" | string;
+  from?: string;
+  to?: string;
+  fromLedger?: number;
+  toLedger?: number;
+}
+
 export interface CallResult {
   contract_id: string;
   function: string;
@@ -322,6 +344,47 @@ export class LumenqraphClient {
     return this.get(`/contracts/${enc(contractId)}/interface`, {
       version,
     }, opts.signal);
+  }
+
+  /**
+   * Retrieve a generated SDK client for a contract.
+   * Returns the generated source code as a string.
+   */
+  generateSdk(
+    contractId: string,
+    opts?: { lang?: "ts"; version?: number } & RequestOptions,
+  ): Promise<string> {
+    return this.get<string>(
+      `/contracts/${enc(contractId)}/sdk`,
+      {
+        lang: opts?.lang,
+        version: opts?.version,
+      },
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Retrieve time-bucketed event statistics for a contract.
+   */
+  getStats(
+    contractId: string,
+    opts: GetStatsOptions = {},
+  ): Promise<StatsResponse> {
+    return this.get<StatsResponse>(
+      `/contracts/${enc(contractId)}/stats`,
+      {
+        resolution: opts.resolution,
+        window: opts.window,
+        bucket: opts.bucket,
+        group_by: opts.groupBy,
+        from: opts.from,
+        to: opts.to,
+        from_ledger: opts.fromLedger,
+        to_ledger: opts.toLedger,
+      },
+      opts.signal,
+    );
   }
 
   /** Versioned instance-storage snapshots, newest first (`limit=1` = current). */

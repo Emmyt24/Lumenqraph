@@ -46,6 +46,119 @@ struct RpcError {
     message: String,
 }
 
+/// Soroban RPC / JSON-RPC error codes distinguishing retryable (transient)
+/// from non-retryable (permanent) errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SorobanRpcErrorCode {
+    /// -32700: Parse error (invalid JSON received by the server).
+    ParseError,
+    /// -32600: Invalid Request (the JSON sent is not a valid Request object).
+    InvalidRequest,
+    /// -32601: Method not found (the method does not exist / is not available).
+    MethodNotFound,
+    /// -32602: Invalid params (invalid method parameter(s), e.g. invalid contract ID).
+    InvalidParams,
+    /// -32603: Internal JSON-RPC error.
+    InternalError,
+    /// -32000: Generic server error.
+    ServerError,
+    /// -32001: Soroban RPC resource/processing limit exceeded.
+    ProcessingLimitExceeded,
+    /// Any other RPC error code.
+    Other(i64),
+}
+
+impl SorobanRpcErrorCode {
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            -32700 => Self::ParseError,
+            -32600 => Self::InvalidRequest,
+            -32601 => Self::MethodNotFound,
+            -32602 => Self::InvalidParams,
+            -32603 => Self::InternalError,
+            -32000 => Self::ServerError,
+            -32001 => Self::ProcessingLimitExceeded,
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn code(&self) -> i64 {
+        match self {
+            Self::ParseError => -32700,
+            Self::InvalidRequest => -32600,
+            Self::MethodNotFound => -32601,
+            Self::InvalidParams => -32602,
+            Self::InternalError => -32603,
+            Self::ServerError => -32000,
+            Self::ProcessingLimitExceeded => -32001,
+            Self::Other(c) => *c,
+        }
+    }
+
+    /// Whether this error represents a transient, server-side condition that is safe to retry.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessingLimitExceeded | Self::InternalError | Self::ServerError
+        )
+    }
+
+    /// Whether this error represents a permanent, client-side condition (e.g. invalid params, method not found).
+    pub fn is_permanent(&self) -> bool {
+        !self.is_retryable()
+    }
+}
+
+/// Represents a classified error returned by Soroban RPC.
+#[derive(Debug, Clone)]
+pub struct SorobanRpcError {
+    pub code: i64,
+    pub message: String,
+    pub method: String,
+    pub error_code: SorobanRpcErrorCode,
+}
+
+impl SorobanRpcError {
+    pub fn new(code: i64, message: impl Into<String>, method: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            method: method.into(),
+            error_code: SorobanRpcErrorCode::from_code(code),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.error_code.is_retryable()
+    }
+
+    pub fn is_permanent(&self) -> bool {
+        self.error_code.is_permanent()
+    }
+}
+
+impl std::fmt::Display for SorobanRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rpc {} error {}: {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for SorobanRpcError {}
+
+/// Returns true if the given error contains a non-retryable Soroban RPC error.
+pub fn is_non_retryable_rpc_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(e) = cause.downcast_ref::<SorobanRpcError>() {
+            return e.is_permanent();
+        }
+    }
+    false
+}
+
 // ---- getLatestLedger ----
 
 #[derive(Deserialize)]
@@ -257,20 +370,19 @@ impl RpcClient {
 
             if let Some(err) = resp.error {
                 self.calls_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if err.code == -32001 {
-                    // -32001: "processing limit" — the RPC is overloaded.
-                    // Transient; retry with backoff.
-                    self.calls_failed_32001.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    last_err = Some(anyhow!(
-                        "rpc {method} error {}: {}",
-                        err.code,
-                        err.message
-                    ));
+                let rpc_err = SorobanRpcError::new(err.code, err.message, method);
+                if rpc_err.is_retryable() {
+                    if err.code == -32001 {
+                        // -32001: "processing limit" — the RPC is overloaded.
+                        // Transient; retry with backoff.
+                        self.calls_failed_32001.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    last_err = Some(anyhow!(rpc_err));
                     continue; // retry
                 }
-                // Any other RPC error (bad params, unknown method, etc.) is a
-                // logic bug, not transience — surface it immediately.
-                return Err(anyhow!("rpc {method} error {}: {}", err.code, err.message));
+                // Non-retryable error (invalid params, method not found, etc.)
+                // is permanent — propagate immediately as anyhow::Error without retrying.
+                return Err(anyhow!(rpc_err));
             }
 
             return resp
@@ -809,6 +921,51 @@ mod tests {
             1,
             "must not retry on non-transient rpc error codes"
         );
+        assert!(is_non_retryable_rpc_error(&err));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_on_method_not_found_rpc_error() {
+        // RPC error -32601 (method not found) should surface immediately without retrying.
+        const ERR_32601: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let count = Arc::new(AtomicUsize::new(0));
+        let url = spawn_counting_mock(
+            count.clone(),
+            Arc::new(|_| (200, ERR_32601)),
+        )
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let err = client
+            .get_latest_ledger()
+            .await
+            .expect_err("method not found rpc error should fail immediately");
+        assert!(
+            err.to_string().contains("-32601"),
+            "unexpected error message: {err}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "must not retry on method not found"
+        );
+        assert!(is_non_retryable_rpc_error(&err));
+    }
+
+    #[test]
+    fn soroban_rpc_error_code_classification() {
+        assert!(SorobanRpcErrorCode::ProcessingLimitExceeded.is_retryable());
+        assert!(SorobanRpcErrorCode::InternalError.is_retryable());
+        assert!(SorobanRpcErrorCode::ServerError.is_retryable());
+
+        assert!(SorobanRpcErrorCode::InvalidParams.is_permanent());
+        assert!(SorobanRpcErrorCode::MethodNotFound.is_permanent());
+        assert!(SorobanRpcErrorCode::InvalidRequest.is_permanent());
+        assert!(SorobanRpcErrorCode::ParseError.is_permanent());
+        assert!(SorobanRpcErrorCode::Other(-99999).is_permanent());
+
+        assert!(!SorobanRpcErrorCode::InvalidParams.is_retryable());
+        assert!(!SorobanRpcErrorCode::MethodNotFound.is_retryable());
     }
 
     #[tokio::test]

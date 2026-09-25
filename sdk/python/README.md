@@ -199,7 +199,15 @@ python -m build
 
 ### Publishing to PyPI
 
+Releases are published automatically by the `pypi-publish` GitHub Actions workflow
+when a `v*` tag is pushed. Pre-release tags (for example `v0.2.0-rc.1`) are published
+to TestPyPI first; stable tags go to PyPI via Trusted Publishing (OIDC, no API token).
+The workflow fails if the version in `pyproject.toml` does not match the tag.
+
+To publish manually:
+
 ```bash
+python -m build
 python -m twine upload dist/*
 ```
 
