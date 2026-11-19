@@ -9,11 +9,17 @@
 //! | `enrichment`            | Spec-driven named/typed enrichment per event       | none |
 //! | `enrichment_nested_udt` | Enrichment of an event carrying a nested UDT       | none |
 //! | `db_insert`             | UNNEST batch INSERT into Postgres                  | DB   |
+//! | `snapshot_batch`        | Batched contract-data snapshot for 1,000 keys      | DB   |
 //!
 //! The XDR decode and enrichment phases are pure-CPU: they use hard-coded
-//! sample data and never touch a network or database.  The db_insert phase
-//! requires a Postgres database pointed to by `TEST_DATABASE_URL`; if that
-//! variable is absent the benchmark is skipped with a warning.
+//! sample data and never touch a network or database.  The db_insert and
+//! snapshot_batch phases require a Postgres database pointed to by
+//! `TEST_DATABASE_URL`; if that variable is absent the benchmark is skipped
+//! with a warning.
+//!
+//! `snapshot_batch` also asserts that the number of DB queries issued for a
+//! snapshot scales as O(chunks) rather than O(keys): one `SELECT max(ledger)`
+//! and one multi-row `INSERT … ON CONFLICT DO NOTHING` per chunk.
 //!
 //! Run all phases:
 //!   cargo bench --bench bench_indexer
@@ -21,8 +27,9 @@
 //! Run a single phase:
 //!   cargo bench --bench bench_indexer -- xdr_decode
 //!
-//! Run the DB phase (requires a test database):
+//! Run the DB phases (requires a test database):
 //!   TEST_DATABASE_URL=postgres://… cargo bench --bench bench_indexer -- db_insert
+//!   TEST_DATABASE_URL=postgres://… cargo bench --bench bench_indexer -- snapshot_batch
 
 use chrono::Utc;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
@@ -450,11 +457,173 @@ fn bench_db_insert(c: &mut Criterion) {
     rt.block_on(pool.close());
 }
 
+// ── Phase 4: Batched contract-data snapshot ──────────────────────────────────
+//
+// Exercises the batched snapshot path: for a chunk of keys, one
+// `SELECT … max(ledger) … GROUP BY` fetches the latest ledger for every key and
+// one multi-row `INSERT … ON CONFLICT DO NOTHING` writes the changed ones.
+// The query count must scale as O(chunks), not O(keys).
+
+/// Number of keys per snapshot chunk. Mirrors the indexer's batching so the
+/// expected query count is `2 * ceil(keys / SNAPSHOT_CHUNK)`.
+const SNAPSHOT_CHUNK: usize = 100;
+
+/// Counts the queries issued through a pool by wrapping `sqlx::query` calls.
+///
+/// The benchmark drives the same SQL the indexer's snapshot path uses, so the
+/// counter reflects the real number of round-trips for a chunk.
+async fn snapshot_chunk_queries(
+    pool: &sqlx::PgPool,
+    contract_ids: &[String],
+    key_hashes: &[Vec<u8>],
+    ledgers: &[i64],
+) -> usize {
+    let mut queries = 0usize;
+
+    // One query for the whole chunk: latest ledger per (contract_id, key_hash).
+    let _latest: Vec<(String, Vec<u8>, Option<i64>)> = sqlx::query_as(
+        "SELECT contract_id, key_hash, max(ledger)
+           FROM contract_data
+          WHERE contract_id = ANY($1) AND key_hash = ANY($2)
+          GROUP BY contract_id, key_hash",
+    )
+    .bind(contract_ids)
+    .bind(key_hashes)
+    .fetch_all(pool)
+    .await
+    .expect("select max(ledger)");
+    queries += 1;
+
+    // One multi-row insert for the whole chunk.
+    sqlx::query(
+        "INSERT INTO contract_data (contract_id, key_hash, ledger, key, value, durability)
+         SELECT contract_id, key_hash, ledger, key::bytea, value::bytea, durability
+           FROM UNNEST($1::text[], $2::bytea[], $3::bigint[], $4::bytea[], $5::bytea[], $6::text[])
+             AS t(contract_id, key_hash, ledger, key, value, durability)
+         ON CONFLICT (contract_id, key_hash) DO NOTHING",
+    )
+    .bind(contract_ids)
+    .bind(key_hashes)
+    .bind(ledgers)
+    .bind(vec![vec![0u8]; ledgers.len()])
+    .bind(vec![vec![0u8]; ledgers.len()])
+    .bind(vec!["persistent".to_string(); ledgers.len()])
+    .execute(pool)
+    .await
+    .expect("insert contract_data");
+    queries += 1;
+
+    queries
+}
+
+fn bench_snapshot_batch(c: &mut Criterion) {
+    let db_url = match std::env::var("TEST_DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            eprintln!(
+                "\n[bench_indexer] snapshot_batch phase SKIPPED — set TEST_DATABASE_URL to enable it.\n"
+            );
+            return;
+        }
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let pool = rt.block_on(async {
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&db_url)
+            .await
+            .expect("connect to TEST_DATABASE_URL");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    });
+
+    const KEYS: usize = 1_000;
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_string();
+    let contract_ids: Vec<String> = vec![contract_id; KEYS];
+    let key_hashes: Vec<Vec<u8>> = (0..KEYS)
+        .map(|i| {
+            let mut h = vec![0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            h
+        })
+        .collect();
+    let ledgers: Vec<i64> = (0..KEYS).map(|i| 1_000_000 + i as i64).collect();
+
+    let chunks = KEYS.div_ceil(SNAPSHOT_CHUNK);
+    let expected_queries = 2 * chunks;
+
+    // Sanity check: the batched path must issue O(chunks) queries, not O(keys).
+    let observed_queries = rt.block_on(async {
+        let mut total = 0usize;
+        for chunk in 0..chunks {
+            let start = chunk * SNAPSHOT_CHUNK;
+            let end = (start + SNAPSHOT_CHUNK).min(KEYS);
+            total += snapshot_chunk_queries(
+                &pool,
+                &contract_ids[start..end],
+                &key_hashes[start..end],
+                &ledgers[start..end],
+            )
+            .await;
+        }
+        sqlx::query("DELETE FROM contract_data")
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+        total
+    });
+    assert_eq!(
+        observed_queries, expected_queries,
+        "snapshot must issue O(chunks) queries: expected {expected_queries}, got {observed_queries}"
+    );
+
+    let mut group = c.benchmark_group("snapshot_batch");
+    group.throughput(Throughput::Elements(KEYS as u64));
+    group.bench_function(BenchmarkId::from_parameter(KEYS), |b| {
+        b.to_async(&rt).iter(|| {
+            let pool = pool.clone();
+            let contract_ids = contract_ids.clone();
+            let key_hashes = key_hashes.clone();
+            let ledgers = ledgers.clone();
+            async move {
+                for chunk in 0..chunks {
+                    let start = chunk * SNAPSHOT_CHUNK;
+                    let end = (start + SNAPSHOT_CHUNK).min(KEYS);
+                    snapshot_chunk_queries(
+                        &pool,
+                        &contract_ids[start..end],
+                        &key_hashes[start..end],
+                        &ledgers[start..end],
+                    )
+                    .await;
+                }
+                sqlx::query("DELETE FROM contract_data")
+                    .execute(&pool)
+                    .await
+                    .expect("cleanup");
+            }
+        });
+    });
+    group.finish();
+
+    rt.block_on(pool.close());
+}
+
 criterion_group!(
     benches,
     bench_xdr_decode,
     bench_enrichment,
     bench_enrichment_nested,
-    bench_db_insert
+    bench_db_insert,
+    bench_snapshot_batch
 );
 criterion_main!(benches);

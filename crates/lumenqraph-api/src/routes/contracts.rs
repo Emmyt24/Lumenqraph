@@ -588,20 +588,27 @@ fn default_data_limit() -> i64 {
 }
 
 /// One `contract_data` row as selected below: (key_hash, key, durability,
-/// ledger, value, label, captured_at).
+/// ledger, value, label, captured_at, deleted, archived).
 type DataRow = (
     String,
     SqlxJson<Value>,
     String,
     i64,
-    SqlxJson<Value>,
+    Option<SqlxJson<Value>>,
     Option<String>,
     DateTime<Utc>,
+    bool,
+    bool,
 );
 
 /// `GET /contracts/:id/data` — the current value of every *per-key* entry
 /// snapshotted for this contract (e.g. every tracked holder balance), one row
 /// per key (its latest snapshot). Requires the indexer's key indexing.
+///
+/// Keys whose newest row is a tombstone (the entry was deleted or expired, or
+/// a persistent entry was archived) are reported as absent rather than with
+/// their stale last value (#742): a deleted key is omitted from `keys` and
+/// listed under `deleted` as `{ "key_hash", "key", "deleted_at_ledger" }`.
 pub async fn contract_data(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
@@ -609,11 +616,13 @@ pub async fn contract_data(
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 1000);
     // DISTINCT ON gives the newest row per key_hash; the outer query orders and
-    // bounds the set of keys returned.
+    // bounds the set of keys returned. Tombstones are included here so the
+    // newest row per key is always the truth, then split out below.
     let rows: Vec<DataRow> = sqlx::query_as(
-        "SELECT key_hash, key, durability, ledger, value, label, captured_at FROM (
+        "SELECT key_hash, key, durability, ledger, value, label, captured_at, deleted, archived FROM (
                  SELECT DISTINCT ON (key_hash)
-                        key_hash, key, durability, ledger, value, label, captured_at
+                        key_hash, key, durability, ledger, value, label, captured_at,
+                        deleted, archived
                  FROM contract_data
                  WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
                  ORDER BY key_hash, ledger DESC
@@ -643,26 +652,41 @@ pub async fn contract_data(
         ));
     }
 
-    let keys: Vec<Value> = rows
-        .into_iter()
-        .map(
-            |(key_hash, key, durability, ledger, value, label, captured_at)| {
-                json!({
-                    "key_hash": key_hash,
-                    "key": key.0,
-                    "durability": durability,
-                    "ledger": ledger,
-                    "value": value.0,
-                    "label": label,
-                    "captured_at": captured_at,
-                })
-            },
-        )
-        .collect();
+    let mut keys: Vec<Value> = Vec::new();
+    let mut deleted: Vec<Value> = Vec::new();
+    for (key_hash, key, durability, ledger, value, label, captured_at, is_deleted, archived) in
+        rows
+    {
+        if is_deleted || value.is_none() {
+            // The entry is gone: report it as absent, never with its stale
+            // last value. `archived` distinguishes a restorable persistent
+            // entry from one that was actually deleted.
+            deleted.push(json!({
+                "key_hash": key_hash,
+                "key": key.0,
+                "durability": durability,
+                "label": label,
+                "deleted_at_ledger": ledger,
+                "archived": archived,
+            }));
+            continue;
+        }
+        keys.push(json!({
+            "key_hash": key_hash,
+            "key": key.0,
+            "durability": durability,
+            "ledger": ledger,
+            "value": value.map(|v| v.0),
+            "label": label,
+            "captured_at": captured_at,
+        }));
+    }
     Ok(Json(json!({
         "contract_id": contract_id,
         "count": keys.len(),
         "keys": keys,
+        "deleted_count": deleted.len(),
+        "deleted": deleted,
     })))
 }
 
@@ -682,17 +706,19 @@ pub async fn contract_data_key(
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 500);
-    // (key, durability, ledger, value, label, captured_at)
+    // (key, durability, ledger, value, label, captured_at, deleted, archived)
     type HistRow = (
         SqlxJson<Value>,
         String,
         i64,
-        SqlxJson<Value>,
+        Option<SqlxJson<Value>>,
         Option<String>,
         DateTime<Utc>,
+        bool,
+        bool,
     );
     let rows: Vec<HistRow> = sqlx::query_as(
-        "SELECT key, durability, ledger, value, label, captured_at
+        "SELECT key, durability, ledger, value, label, captured_at, deleted, archived
              FROM contract_data
              WHERE contract_id = $1 AND key_hash = $2
              ORDER BY ledger DESC LIMIT $3",
@@ -711,10 +737,21 @@ pub async fn contract_data_key(
     let key = rows[0].0 .0.clone();
     let durability = rows[0].1.clone();
     let label = rows[0].4.clone();
+    // The newest row decides whether the key currently exists.
+    let deleted = rows[0].6;
+    let archived = rows[0].7;
     let versions: Vec<Value> = rows
         .into_iter()
-        .map(|(_, _, ledger, value, _, captured_at)| {
-            json!({ "ledger": ledger, "value": value.0, "captured_at": captured_at })
+        .map(|(_, _, ledger, value, _, captured_at, is_deleted, is_archived)| {
+            // Tombstone rows carry no value; expose them so a caller can see
+            // exactly when the entry was deleted or expired (#742).
+            json!({
+                "ledger": ledger,
+                "value": value.map(|v| v.0),
+                "deleted": is_deleted,
+                "archived": is_archived,
+                "captured_at": captured_at,
+            })
         })
         .collect();
     Ok(Json(json!({
@@ -723,6 +760,8 @@ pub async fn contract_data_key(
         "key": key,
         "durability": durability,
         "label": label,
+        "deleted": deleted,
+        "archived": archived,
         "count": versions.len(),
         "versions": versions,
     })))

@@ -461,9 +461,12 @@ async fn fetch_and_store_with_shutdown(
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
     // contract -> (template_index, key_params) for per-key template snapshots.
+    // A set, not a list: a popular holder can appear in hundreds of events in
+    // one cycle, and each duplicate would otherwise fill the getLedgerEntries
+    // batch budget and trigger a redundant change-detection query (#744).
     let mut template_keys_by_contract: std::collections::HashMap<
         String,
-        Vec<(usize, Vec<String>)>,
+        std::collections::HashSet<(usize, Vec<String>)>,
     > = std::collections::HashMap::new();
     loop {
         if shutdown.is_cancelled() {
@@ -550,7 +553,7 @@ async fn fetch_and_store_with_shutdown(
                     template_keys_by_contract
                         .entry(new_event.contract_id.clone())
                         .or_default()
-                        .push((idx, params));
+                        .insert((idx, params));
                 }
             }
             batch.push(new_event);
@@ -621,7 +624,8 @@ async fn fetch_and_store_with_shutdown(
         )
         .await;
     }
-    // Snapshot per-key entries from custom templates.
+    // Snapshot per-key entries from custom templates. The per-contract sets are
+    // already deduplicated, so each distinct key is requested once (#744).
     if !template_keys_by_contract.is_empty() {
         state::snapshot_template_keys_batch(
             pool,
@@ -1137,6 +1141,30 @@ mod tests {
             sleep, degraded,
             "degraded interval should be used when circuit is open"
         );
+    }
+
+    /// #744: the same template params discovered from many events in one cycle
+    /// must collapse to a single key before batching.
+    #[test]
+    fn template_keys_are_deduplicated_per_contract() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut template_keys_by_contract: HashMap<String, HashSet<(usize, Vec<String>)>> =
+            HashMap::new();
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_string();
+        let params = vec!["holder".to_string(), "0".to_string()];
+
+        // 50 events, same template params each time.
+        for _ in 0..50 {
+            template_keys_by_contract
+                .entry(contract.clone())
+                .or_default()
+                .insert((0usize, params.clone()));
+        }
+
+        let keys = template_keys_by_contract.get(&contract).unwrap();
+        assert_eq!(keys.len(), 1, "duplicate template keys must collapse to one");
+        assert!(keys.contains(&(0usize, params)));
     }
 
     #[test]
