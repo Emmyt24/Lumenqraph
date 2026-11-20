@@ -227,20 +227,7 @@ async fn metrics(
                 "lumenqraph_indexer_unrecoverable_missed_ranges {}\n",
                 metrics.unrecoverable_missed_ranges
             ));
-            body.push_str("# HELP lumenqraph_transfer_projection_skipped_total Transfer-like events skipped by the SEP-41 projection since start\n");
-            body.push_str("# TYPE lumenqraph_transfer_projection_skipped_total counter\n");
-            body.push_str(&format!(
-                "lumenqraph_transfer_projection_skipped_total {}\n",
-                crate::store::transfer_projection_skipped_total()
-            ));
-            body.push_str("# HELP lumenqraph_webhook_deliveries_dropped_by_retention_total webhook_deliveries rows dropped by retention since start\n");
-            body.push_str(
-                "# TYPE lumenqraph_webhook_deliveries_dropped_by_retention_total counter\n",
-            );
-            body.push_str(&format!(
-                "lumenqraph_webhook_deliveries_dropped_by_retention_total {}\n",
-                crate::retention::webhook_deliveries_dropped_by_retention_total()
-            ));
+            render_process_counters(&mut body);
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");
@@ -252,6 +239,27 @@ async fn metrics(
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         body,
     )
+}
+
+/// Renders the process-wide counters that do not require a database round-trip.
+///
+/// Kept as a pure function so the rendering path can be unit tested without a
+/// live `PgPool` (see `tests::metrics_render_process_counters`).
+fn render_process_counters(body: &mut String) {
+    // Transfer-like events skipped by the SEP-41 projection (#600).
+    body.push_str("# HELP lumenqraph_transfer_projection_skipped_total Transfer-like events skipped by the SEP-41 projection since start\n");
+    body.push_str("# TYPE lumenqraph_transfer_projection_skipped_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_transfer_projection_skipped_total {}\n",
+        crate::store::transfer_projection_skipped_total()
+    ));
+    // webhook_deliveries rows dropped by retention (#601).
+    body.push_str("# HELP lumenqraph_webhook_deliveries_dropped_by_retention_total webhook_deliveries rows dropped by retention since start\n");
+    body.push_str("# TYPE lumenqraph_webhook_deliveries_dropped_by_retention_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_webhook_deliveries_dropped_by_retention_total {}\n",
+        crate::retention::webhook_deliveries_dropped_by_retention_total()
+    ));
 }
 
 /// Constant-time-ish comparison of the `Authorization: Bearer <token>` header.
@@ -490,5 +498,31 @@ mod tests {
         headers.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
         assert!(bearer_token_matches(&headers, "s3cret"));
         assert!(!bearer_token_matches(&headers, "other"));
+    }
+
+    #[test]
+    fn metrics_render_process_counters() {
+        let mut body = String::new();
+        render_process_counters(&mut body);
+
+        // Both process-wide counters must be exported with HELP/TYPE lines.
+        assert!(
+            body.contains("lumenqraph_transfer_projection_skipped_total"),
+            "missing transfer_projection_skipped_total in metrics body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE lumenqraph_transfer_projection_skipped_total counter"),
+            "missing TYPE line for transfer_projection_skipped_total:\n{body}"
+        );
+        assert!(
+            body.contains("lumenqraph_webhook_deliveries_dropped_by_retention_total"),
+            "missing webhook_deliveries_dropped_by_retention_total in metrics body:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "# TYPE lumenqraph_webhook_deliveries_dropped_by_retention_total counter"
+            ),
+            "missing TYPE line for webhook_deliveries_dropped_by_retention_total:\n{body}"
+        );
     }
 }

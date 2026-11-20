@@ -33,7 +33,6 @@ fn record_vertical_projection_failed() {
 
 /// Total number of transfer-like events skipped by the projection since process
 /// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
-#[allow(dead_code)] // read by the metrics endpoint
 pub fn transfer_projection_skipped_total() -> u64 {
     TRANSFER_PROJECTION_SKIPPED.load(Ordering::Relaxed)
 }

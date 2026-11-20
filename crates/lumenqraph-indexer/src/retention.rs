@@ -37,7 +37,6 @@ static WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION: std::sync::atomic::AtomicU64 =
 
 /// Total `webhook_deliveries` rows dropped by retention since process start.
 /// Exported for the metrics endpoint.
-#[allow(dead_code)]
 pub fn webhook_deliveries_dropped_by_retention_total() -> u64 {
     WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION.load(std::sync::atomic::Ordering::Relaxed)
 }

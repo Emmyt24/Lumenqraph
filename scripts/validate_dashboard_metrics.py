@@ -32,7 +32,9 @@ def extract_metrics_from_rust(rust_dir: str) -> set[str]:
     """Extract all metric names defined in Rust source code."""
     metrics = set()
 
-    for rust_file in Path(rust_dir).rglob("metrics.rs"):
+    # Scan every Rust source file so counters defined outside `metrics.rs`
+    # (e.g. `store.rs`, `retention.rs`, `http.rs`) are also discovered.
+    for rust_file in Path(rust_dir).rglob("*.rs"):
         with open(rust_file) as f:
             content = f.read()
             # Find all metric definitions: "lumenqraph_metric_name"

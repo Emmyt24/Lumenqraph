@@ -78,6 +78,17 @@ To send alerts to Alertmanager, set the `alerting.alertmanagers` targets in `pro
 - **`lumenqraph_indexer_chain_tip_ledger`** - Latest ledger on chain
 - **`lumenqraph_indexer_events_ingested_total`** - Events ingested by the indexer process (cumulative). The API also exposes `lumenqraph_indexer_ingested_total`, derived from the database.
 - **`lumenqraph_indexer_errors_total`** - Total indexer poll-cycle errors (cumulative)
+- **`lumenqraph_transfer_projection_skipped_total`** - Cumulative count of
+  transfer-like events skipped by the SEP-41 projection gate (#600). A
+  non-zero, rising value means events are being dropped before projection;
+  investigate the gate's classification rules.
+- **`lumenqraph_webhook_deliveries_dropped_by_retention_total`** - Cumulative
+  count of `webhook_deliveries` rows dropped by the retention job (#601). A
+  rising value means deliveries are being lost to retention before they are
+  dispatched; consider raising the retention window or draining the backlog.
+
+Both counters are exported on the indexer `/metrics` endpoint and have
+dedicated Grafana dashboard panels.
 
 ### API Metrics
 
